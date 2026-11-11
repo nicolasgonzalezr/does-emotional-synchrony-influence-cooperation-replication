@@ -1,0 +1,1083 @@
+---
+title: "Avatar DTW"
+format: html
+editor: visual
+---
+
+```{r}
+
+library(tidyverse)
+library(reticulate)
+library(jsonlite)
+library(dtw)
+library(pbmcapply)
+library(signal)
+library(ggh4x)
+
+py_require(c("numpy", "msgpack"))
+
+np <- import("numpy")
+msgpack <- import("msgpack")
+builtins <- import_builtins()
+```
+
+```{r}
+
+offsets <- readRDS("../Datasets/dataClockOffsets.rds") %>%
+  arrange(
+    session, player, round
+  )
+
+dataAvatar <- readRDS("../Datasets/dataAvatar.rds") %>%
+  left_join(
+    readRDS("../Datasets/dataClockOffsets.rds"),
+    by=join_by(session, player, round)
+  )
+```
+
+## Load Avatar Inference Data
+
+```{r}
+
+read_json_meta <- function(json_path) {
+  meta <- jsonlite::read_json(json_path, simplifyVector = TRUE)
+  list(
+    session  = meta$session,
+    player   = meta$player,
+    round    = meta$round,
+    emotions = as.character(meta$emotions)
+  )
+}
+
+msgpk_stream_to_tibble_safe <- function(msgpk_path) {
+
+  json_path <- sub("\\.msgpk$", ".json", msgpk_path)
+  if (!file.exists(json_path)) {
+    message("[MISSING JSON] ", msgpk_path)
+    return(NULL)
+  }
+
+  meta <- tryCatch(read_json_meta(json_path), error = function(e) {
+    message("[BAD JSON] ", msgpk_path, " | ", conditionMessage(e))
+    NULL
+  })
+  if (is.null(meta)) return(NULL)
+
+  f <- builtins$open(msgpk_path, "rb")
+  on.exit(f$close(), add = TRUE)
+  u <- msgpack$Unpacker(f, raw = FALSE)
+
+  f$seek(0L, 2L); size <- as.numeric(f$tell()); f$seek(0L, 0L)
+
+  ts    <- list()
+  sm    <- list()
+  ema   <- list()   # <-- add
+  spont <- list()   # <-- add
+  pr    <- list()
+
+  last_pos <- -1
+  i <- 0L
+
+  get_num_or_na <- function(x, key) {
+    v <- x[[key]]
+    if (is.null(v) || length(v) == 0L || is.na(v)) return(NA_real_)
+    as.numeric(v)
+  }
+
+  repeat {
+    pos <- as.numeric(u$tell())
+    if (pos <= last_pos || pos >= size) break
+    last_pos <- pos
+
+    x <- tryCatch(u$unpack(), error = function(e) NULL)
+    if (is.null(x)) break
+
+    if (!is.list(x)) next
+    if (is.null(x$timestamp) || is.null(x$probs)) next
+
+    i <- i + 1L
+    ts[[i]]    <- as.numeric(x$timestamp)
+    sm[[i]]    <- get_num_or_na(x, "avatarSmile")
+    ema[[i]]   <- get_num_or_na(x, "EMA")
+    spont[[i]] <- get_num_or_na(x, "Spont")
+    pr[[i]]    <- as.numeric(x$probs)
+  }
+
+  if (i == 0L) {
+    message("[CORRUPTED MSGPK] ", msgpk_path)
+    return(NULL)
+  }
+
+  timestamp_raw <- unlist(ts, use.names = FALSE)
+  avatarSmile   <- unlist(sm, use.names = FALSE)
+  EMA           <- unlist(ema, use.names = FALSE)
+  spontSmile    <- unlist(spont, use.names = FALSE)
+  probs_mat     <- do.call(rbind, pr)
+
+  timestamp <- timestamp_raw
+
+  colnames(probs_mat) <- meta$emotions
+
+  tibble(
+    session     = as.numeric(meta$session),
+    player      = meta$player,
+    round       = as.numeric(meta$round),
+    file        = msgpk_path,
+    timestamp   = timestamp,
+    avatarSmile = avatarSmile,
+    EMA         = EMA,
+    spontSmile  = spontSmile
+  ) %>%
+    bind_cols(as_tibble(probs_mat))
+}
+
+
+
+# ---- scan ----
+root <- "../Recordings/Nico/"
+
+msgpk_files <- list.files(
+  path = root,
+  pattern = "\\.msgpk$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+#inferenceData <- msgpk_files %>%
+#  map(msgpk_stream_to_tibble_safe) %>%
+#  bind_rows()
+
+inference_list <- pbmclapply(
+  msgpk_files,
+  msgpk_stream_to_tibble_safe,
+  mc.cores = 14
+)
+
+```
+
+## Fix clocks
+
+For sessions 1–15, we reconstructed recording times by anchoring elapsed time since the first recorded frame to the UTC start time embedded in each filename. We applied the estimated terminal/session clock correction and expressed timestamps in seconds relative to the central round start. Because this reconstruction omits the interval between initialization and the first recorded frame, we shifted these timestamps by the difference in median recording onset between earlier and later sessions, aligning their medians.
+
+```{r}
+
+inferenceData <- bind_rows(inference_list)
+
+dataAvatar <- readRDS("../Datasets/dataAvatar.rds")
+
+inferenceData <- inferenceData %>%
+  left_join(
+    dataAvatar %>%
+      dplyr::select(
+        session, player, round, terminal, roundStart, roundEnd, roundTime, agreement, experimental
+      )
+    ,
+    by = c("session", "player", "round")
+  ) %>%
+  mutate(
+    avatarSmile = ifelse(
+      avatarSmile < 0.15, 0.15, avatarSmile
+    )
+  )
+
+inferenceData <- inferenceData %>%
+  left_join(
+    readRDS("../Datasets/dataOffsetTerminal.rds"),
+    by = c("session", "terminal")
+  ) %>%
+  dplyr::select(
+    session, player, terminal, round, timestamp, roundTime, roundStart, roundEnd, agreement, medianClockOffset, meanClockOffset, avatarSmile, EMA, spontSmile, Neutral, Happy, Sad, Surprise, Fear, Disgust, Angry, experimental, file
+  )
+
+post15 <- inferenceData %>%
+  dplyr::filter(session > 15) %>%
+  mutate(
+    timestamp = timestamp + medianClockOffset
+  )
+
+startStatsPost <- post15 %>%
+  group_by(session, player, round) %>%
+  summarise(
+    start = first(timestamp)
+  ) %>%
+  ungroup() %>%
+  summarise(
+    meanStart = mean(start, na.rm=TRUE),
+    medianStart = median(start, na.rm=TRUE),
+  )
+
+medianStartPost <- startStatsPost %>%
+  pull(medianStart)
+
+pre15 <- inferenceData %>%
+  dplyr::filter(session <= 15) %>%
+  group_by(session, player, round, timestamp) %>%
+  summarise(
+    nReps = n(),
+    .groups = "drop"
+  ) %>%
+  group_by(session, player, round) %>%
+  arrange(timestamp, .by_group = TRUE) %>%
+  mutate(
+    diffTs = lead(timestamp) - timestamp,
+    diffTs = coalesce(diffTs, lag(diffTs), 0),
+    residualTs = diffTs / nReps
+  ) %>%
+  ungroup()
+
+pre15 <- inferenceData %>%
+  dplyr::filter(session <= 15) %>%
+  left_join(
+    pre15, by=c("session", "player", "round", "timestamp")
+  ) %>%
+  group_by(session, player, round, timestamp) %>%
+  mutate(
+    interpolationTs = cumsum(residualTs) - residualTs
+  ) %>%
+  group_by(session, player, round) %>%
+  mutate(
+    referenceUTC = as.POSIXct(
+      stringr::str_extract(file, "\\d{8}T\\d{6}Z"),
+      format = "%Y%m%dT%H%M%SZ",
+      tz = "UTC"
+    ),
+    timestamp = as.numeric(
+      difftime(referenceUTC, roundStart, units = "secs")
+    ) + (timestamp - first(timestamp)) + interpolationTs + medianClockOffset
+  ) %>%
+  ungroup() %>%
+  dplyr::select(-c(referenceUTC, interpolationTs, residualTs, diffTs, nReps))
+
+startStatsPre <- pre15 %>%
+  group_by(session, player, round) %>%
+  summarise(
+    start = first(timestamp)
+  ) %>%
+  ungroup() %>%
+  summarise(
+    meanStart = mean(start, na.rm=TRUE),
+    medianStart = median(start, na.rm=TRUE),
+  )  
+
+startStatsPre <- startStatsPre %>%
+  pull(medianStart)
+
+pre15$timestamp <- pre15$timestamp + medianStartPost - startStatsPre
+
+inferenceData <- dplyr::bind_rows(pre15, post15) %>%
+  dplyr::select(-c(meanClockOffset, medianClockOffset))
+
+generalOffset <- inferenceData %>%
+  dplyr::filter(
+    roundTime <= 65
+  ) %>%
+  group_by(session, player, round) %>%
+  summarise(
+    lastDif =  last(timestamp) - last(roundTime)
+  ) %>%
+  ungroup() %>%
+  summarise(
+    medianDif = median(lastDif, na.rm = TRUE),
+    meanDif   = mean(lastDif, na.rm = TRUE)
+  )
+
+generalOffset <- generalOffset %>%
+  pull(medianDif)
+
+inferenceData <- inferenceData %>%
+  dplyr::filter(
+    is.finite(timestamp)
+  ) %>%
+  mutate(
+    timestamp = timestamp + 3 - generalOffset
+  )
+
+rm(pre15, post15)
+```
+
+### DTW
+
+```{r}
+
+shapeDescriptor <- function(x, windowSize) {
+  
+  stopifnot(windowSize %% 2 == 1)
+  
+  padding <- (windowSize - 1) / 2
+  
+  xPadded <- rbind(
+    x[rep(1, padding), , drop = FALSE],
+    x,
+    x[rep(nrow(x), padding), , drop = FALSE]
+  )
+  
+  embed(xPadded, dimension = windowSize)
+}
+
+derivDescriptor <- function(x, windowSize, fps) {
+  
+  do.call(
+    cbind,
+    lapply(
+      seq_len(ncol(x)),
+      function(j) {
+        signal::sgolayfilt(
+          x[, j],
+          p = 2,
+          n = windowSize,
+          m = 1,
+          ts = 1 / fps # DEFINE BASED ON REALIZED FPS
+        )
+      }
+    )
+  )
+}
+
+alignFun <- function(signal1, signal2, timestamps, warpingWindow = 3, fps) {
+  
+  aligned <- dtw(
+    signal1, 
+    signal2,
+    dist.method = "Euclidean",
+    step.pattern = symmetric2,
+    window.type = "sakoechiba",
+    window.size = fps * warpingWindow, # median fps times allowed warping seconds
+    open.begin = FALSE,
+    open.end   = FALSE,
+    keep = FALSE, # don't store cost matrix
+    distance.only = FALSE # don't return only scalar distance
+  )
+  
+  aligned1 <- signal1[aligned$index1, , drop=FALSE]
+  aligned2 <- signal2[aligned$index2, , drop=FALSE]
+  
+  pathIndex <- pmax(
+    aligned$index1,
+    aligned$index2
+  )
+  
+  return(
+    list(
+      distance = aligned$normalizedDistance, 
+      path = unname(sqrt(rowSums((aligned1 - aligned2)^2))),
+      pathTimestamps = timestamps[pathIndex],
+      step = aligned$stepsTaken,
+      warpingWindow = warpingWindow
+    )
+  )
+}
+
+dtwFun <- function(signal1, signal2, timestamps, type="standard", warpingWindow=3, descriptorWindow=3, fps) {
+  
+  if (type=="standard") {
+    
+    aligned <- alignFun(signal1, signal2, timestamps, warpingWindow, fps)
+    
+  } else if (type=="shape") {
+    
+    shape1 <- shapeDescriptor(signal1, descriptorWindow)
+    
+    shape2 <- shapeDescriptor(signal2, descriptorWindow)
+    
+    aligned <- alignFun(shape1, shape2, timestamps, warpingWindow, fps)
+    
+  } else if (type=="derivative") {
+    
+    derivative1 <- derivDescriptor(signal1, descriptorWindow, fps)
+    
+    derivative2 <- derivDescriptor(signal2, descriptorWindow, fps)
+    
+    aligned <- alignFun(derivative1, derivative2, timestamps, warpingWindow, fps)
+    
+  } else {
+    return(NULL)
+  }
+  
+  return(aligned)
+}
+```
+
+```{r}
+
+alignAvatar <- function(id, data, type, warpingWindow=3, windowTime=0.1) {
+  
+  dataPlayer <- data %>%
+    dplyr::filter(
+      playerID == id, 
+      !is.na(avatarSmile), 
+      !is.na(Happy)
+    )
+  
+  roundTime <- dataPlayer$roundTime[1]
+  agreement <- dataPlayer$agreement[1]
+  
+  
+  medianFPS <- dataPlayer %>%
+    mutate(
+      fps = 1 / (timestamp - lag(timestamp))
+    ) %>%
+    summarise(
+      medianFPS = median(fps, na.rm=TRUE)
+    ) %>%
+    pull(medianFPS)
+  
+  signalPlayer <- as.matrix(dataPlayer$Happy)
+  signalAvatar <- as.matrix(dataPlayer$avatarSmile)
+  timestamps   <- dataPlayer$timestamp
+  
+  windowRaw <- medianFPS * windowTime
+  windowFrames <- as.integer(
+    2 * round((windowRaw - 1) / 2) + 1
+  ) # Round to closest odd
+  
+  realizedWindowTime <- windowFrames / medianFPS
+  realizedWindowTime
+  
+  aligned <- dtwFun(signalPlayer, signalAvatar, timestamps=timestamps, type, warpingWindow, descriptorWindow=windowFrames, fps=medianFPS)
+  
+  result <- list(list(aligned=aligned))
+  
+  names(result) <- type
+  
+  return(list(playerID=id, roundTime=roundTime, agreement=agreement, windowTime=realizedWindowTime, aligned=aligned))
+}
+```
+
+## Run alignment
+
+```{r}
+
+inferenceData <- inferenceData %>%
+  arrange(
+    session, player, round, timestamp
+  ) %>%
+  mutate(
+    playerID = paste0(session, player, round)
+  )
+
+uniqueIDs <- unique(inferenceData$playerID)
+
+dtwType <- "shape"
+windowTime <- 0.1 # Descriptor window in seconds 
+warpingSeconds <- 3 # Seconds of warping allowed
+
+dtwResults <- pbmclapply(
+  uniqueIDs,
+  alignAvatar,
+  data=inferenceData,
+  type=dtwType,
+  warpingWindow=warpingSeconds,
+  windowTime=windowTime,
+  mc.cores = 15,
+  mc.preschedule = FALSE
+)
+
+resultsPath <- "../Datasets/dtwResultsAvatar.rds"
+
+storedResults <- if (file.exists(resultsPath)) {
+  readRDS(resultsPath)
+} else {
+  list()
+}
+
+for (i in seq_along(dtwResults)) {
+  if (i > length(storedResults)) {
+    storedResults[i] <- dtwResults[i]
+    storedResults[[i]][["aligned"]] <- list()
+  }
+  storedResults[[i]][["aligned"]][[dtwType]] <-
+    dtwResults[[i]][["aligned"]]
+}
+
+saveRDS(storedResults, file = resultsPath)
+```
+
+### DTW summary
+
+```{r}
+
+dtwProcessFun <- function(dtwData) {
+  dtwSummary <- do.call(
+    dplyr::bind_rows,
+    lapply(
+      dtwData,
+      function(playerData) {
+        results <- do.call(
+          dplyr::bind_rows,
+          lapply(
+            names(playerData$aligned),
+            function(typeName) {
+              
+              roundTime <- playerData$roundTime
+              agreement <- playerData$agreement
+              path      <- playerData$aligned[[typeName]]$path
+              weights   <- c(2, ifelse(playerData$aligned[[typeName]]$step==1, 2, 1))
+              ts        <- playerData$aligned[[typeName]]$pathTimestamps
+              playerID  <- playerData[["playerID"]]
+              
+              preMask  <- ts <= roundTime
+              postMask <- agreement == 1 & ts > roundTime
+              
+              preDTW <- if (any(preMask)) {
+                sum(weights[preMask] * path[preMask]) / sum(weights[preMask])
+              } else {
+                NA_real_
+              }
+              
+              postDTW <- if (any(postMask)) {
+                sum(weights[postMask] * path[postMask]) / sum(weights[postMask])
+              } else {
+                NA_real_
+              }
+              
+              result <- tibble(
+                playerID    = playerData[["playerID"]],
+                type      = typeName,
+                PreDTW  = preDTW,
+                PostDTW = postDTW
+              )
+            }
+          )
+        )
+      }
+    )
+  )
+  
+  dtwSummary <- as.data.frame(dtwSummary)
+  
+  return(dtwSummary)
+}
+```
+
+```{r}
+
+resultsPath <- "../Datasets/dtwResultsAvatar.rds"
+
+storedResults <- readRDS(resultsPath)
+
+dtwDf <- dtwProcessFun(storedResults) %>%
+  pivot_wider(
+    id_cols = playerID,
+    names_from = type,
+    values_from = c(PreDTW, PostDTW),
+    names_glue = "{substr(type, 1, 5)}{.value}"
+  )
+
+saveRDS(dtwDf, file = "../Datasets/dataAvatarDTW.rds")
+```
+
+### DTW long
+
+```{r}
+
+dtwLongFun <- function(halfLife=2, riskWindow=0.25, dtwData) {
+  dtwLong <- do.call(
+    dplyr::bind_rows,
+    lapply(
+      dtwData,
+      function(playerData) {
+        results <- do.call(
+          dplyr::bind_rows,
+          lapply(
+            names(playerData$aligned),
+            function(typeName) {
+              roundTime <- playerData$roundTime
+              agreement <- playerData$agreement
+              path      <- playerData$aligned[[typeName]]$path
+              weights   <- c(2, ifelse(playerData$aligned[[typeName]]$step==1, 2, 1))
+              ts        <- playerData$aligned[[typeName]]$pathTimestamps
+              playerID  <- playerData[["playerID"]]
+              
+              H <- halfLife # Half-life
+              tau <- H / log(2)
+              EMA <- c()
+              tsEMA <- c()
+              i <- 1
+              
+              while (i <= length(ts)) {
+                descriptorMask <- ts == ts[i]
+                descriptor <- sqrt(
+                  sum(weights[descriptorMask]*(path[descriptorMask])^2) / 
+                    sum(weights[descriptorMask])
+                )
+                if (length(EMA) == 0) {
+                  update <- descriptor
+                } else {
+                  dt <- ts[i] - tsEMA[length(tsEMA)]
+                  alpha <- 1 - exp(-dt / tau)
+                  update <- EMA[length(EMA)] + alpha * (descriptor - EMA[length(EMA)])
+                }
+                EMA <- append(EMA, update)
+                tsEMA <- append(tsEMA, ts[i])
+                
+                i <- i + sum(descriptorMask)
+              }
+              
+              roundStart <- 0
+              
+              startTimes <- seq(roundStart, roundTime, by=riskWindow)
+              startTimes <- startTimes[startTimes < roundTime]
+              endTimes <- c(startTimes[-1], roundTime)
+              sampledPath <- c()
+              
+              for (t in startTimes) {
+                
+                leftCandidates <- tsEMA[tsEMA <= t]
+                rightCandidates <- tsEMA[tsEMA > t]
+                
+                if (length(leftCandidates) == 0) {
+                  
+                  sampledPath <- c(sampledPath, NA)
+                  
+                } else {
+                  
+                  leftLimit <- max(leftCandidates)
+                  
+                  if (t - leftLimit > H) {
+                    
+                    sampledPath <- c(sampledPath, NA)
+                    
+                  } else if (length(rightCandidates) == 0) {
+                    
+                    leftEMA <- EMA[match(leftLimit, tsEMA)]
+                    sampledPath <- c(sampledPath, leftEMA)
+                    
+                  } else {
+                    
+                    rightLimit <- min(rightCandidates)
+                    
+                    if (rightLimit - t > H) {
+                      
+                      leftEMA <- EMA[match(leftLimit, tsEMA)]
+                      sampledPath <- c(sampledPath, leftEMA)
+                      
+                    } else {
+                      
+                      weight <- (rightLimit - t) /
+                        (rightLimit - leftLimit)
+                      
+                      leftEMA <- EMA[match(leftLimit, tsEMA)]
+                      rightEMA <- EMA[match(rightLimit, tsEMA)]
+                      
+                      weightedEMA <- weight * leftEMA +
+                        (1 - weight) * rightEMA
+                      
+                      sampledPath <- c(sampledPath, weightedEMA)
+                    }
+                  }
+                }
+              }
+              
+              result <- tibble(
+                playerID  = playerID,
+                type      = typeName,
+                halfLife  = halfLife,
+                valueEMA  = sampledPath,
+                startTime = startTimes,
+                endTime   = endTimes,
+                agreement = as.integer(
+                  agreement == 1 &
+                    seq_along(startTimes) == length(startTimes)
+                )
+              )
+            }
+          )
+        )
+      }
+    )
+  )
+  
+  dtwLong <- as.data.frame(dtwLong)
+  
+  return(dtwLong)
+}
+```
+
+```{r}
+
+resultsPath <- "../Datasets/dtwResultsAvatar.rds"
+
+storedResults <- readRDS(resultsPath)
+
+dfPath <- "../Datasets/dataAvatarLongDTW.rds"
+
+halfLife <- c(1, 2, 5, 10, 20)
+
+dtwLong <- do.call(
+  dplyr::bind_rows,
+  pbmclapply(
+    halfLife,
+    dtwLongFun,
+    riskWindow = 0.25,
+    dtwData = storedResults,
+    mc.cores = length(halfLife)
+  )
+)
+
+dtwLong <- dtwLong %>%
+  pivot_wider(
+    id_cols = c(playerID, startTime, endTime, agreement),
+    names_from = c(type, halfLife),
+    values_from = valueEMA,
+    names_glue = "{substr(type, 1, 5)}EMA_HL{halfLife}s"
+  )
+
+saveRDS(dtwLong, file = dfPath)
+```
+
+## Smiles
+
+### Smiles summary
+
+```{r}
+
+smileSummaryPre <- inferenceData %>%
+  group_by(session, player, round) %>%
+  dplyr::filter(timestamp <= roundTime) %>%
+  summarise(
+    avatarSmilePre = mean(avatarSmile, na.rm=TRUE),
+    playerSmilePre = mean(Happy, na.rm=TRUE)
+  )
+
+smileSummaryPost <- inferenceData %>%
+  group_by(session, player, round) %>%
+  dplyr::filter(timestamp > roundTime) %>%
+  summarise(
+    avatarSmilePost = mean(avatarSmile, na.rm=TRUE),
+    playerSmilePost = mean(Happy, na.rm=TRUE)
+  )
+
+smileSummary <- full_join(smileSummaryPre, smileSummaryPost)
+
+saveRDS(smileSummary, file = "../Datasets/dataAvatarSmiles.rds")
+```
+
+### Smiles long
+
+```{r}
+
+funEMA <- function(signal, ts, tau) {
+  
+  EMA <- numeric(length(signal))
+  EMA[1] <- signal[1]
+  
+  for (i in 2:length(signal)) {
+    dt <- ts[i] - ts[i - 1]
+    alpha <- 1 - exp(-dt / tau)
+    
+    EMA[i] <- EMA[i - 1] +
+      alpha * (signal[i] - EMA[i - 1])
+  }
+  
+  EMA
+}
+
+smoothTs <- function(halfLife=2, riskWindow=0.25, df, session, player, roundNum, roundTime, agreement) {
+  
+  ts <- df$timestamp
+  
+  H <- halfLife # Half-life
+  tau <- H / log(2)
+  
+  playerSeries <- df$Happy
+  avatarSeries <- df$avatarSmile
+  
+  playerEMA <- funEMA(playerSeries, ts, tau)
+  avatarEMA <- funEMA(avatarSeries, ts, tau)
+  
+  roundStart <- 0
+  startTimes <- seq(roundStart, roundTime, by=riskWindow)
+  startTimes <- startTimes[startTimes < roundTime]
+  endTimes <- c(startTimes[-1], roundTime)
+  sampledPlayerEMA <- c()
+  sampledAvatarEMA <- c()
+  
+  for (t in startTimes) {
+    
+    leftCandidates <- ts[ts <= t]
+    rightCandidates <- ts[ts > t]
+    
+    if (length(leftCandidates) == 0) {
+      
+      sampledPlayerEMA <- c(sampledPlayerEMA, NA)
+      sampledAvatarEMA <- c(sampledAvatarEMA, NA)
+      
+    } else {
+      
+      leftLimit <- max(leftCandidates)
+      
+      if (t - leftLimit > H) {
+        
+        sampledPlayerEMA <- c(sampledPlayerEMA, NA)
+        sampledAvatarEMA <- c(sampledAvatarEMA, NA)
+        
+      } else if (length(rightCandidates) == 0) {
+        
+        leftplayerEMA <- playerEMA[match(leftLimit, ts)]
+        sampledPlayerEMA <- c(sampledPlayerEMA, leftplayerEMA)
+        
+        leftAvatarEMA <- avatarEMA[match(leftLimit, ts)]
+        sampledAvatarEMA <- c(sampledAvatarEMA, leftAvatarEMA)
+        
+      } else {
+        
+        rightLimit <- min(rightCandidates)
+        
+        if (rightLimit - t > H) {
+          
+          leftplayerEMA <- playerEMA[match(leftLimit, ts)]
+          sampledPlayerEMA <- c(sampledPlayerEMA, leftplayerEMA)
+          
+          leftAvatarEMA <- avatarEMA[match(leftLimit, ts)]
+          sampledAvatarEMA <- c(sampledAvatarEMA, leftAvatarEMA)
+          
+        } else {
+          
+          weight <- (rightLimit - t) / (rightLimit - leftLimit)
+          
+          leftplayerEMA <- playerEMA[match(leftLimit, ts)]
+          rightPlayerEMA <- playerEMA[match(rightLimit, ts)]
+          
+          weightedPlayerEMA <- weight * leftplayerEMA + (1 - weight) * rightPlayerEMA
+          
+          sampledPlayerEMA <- c(sampledPlayerEMA, weightedPlayerEMA)
+          
+          
+          leftAvatarEMA <- avatarEMA[match(leftLimit, ts)]
+          rightAvatarEMA <- avatarEMA[match(rightLimit, ts)]
+          
+          weightedAvatarEMA <- weight * leftAvatarEMA + (1 - weight) * rightAvatarEMA
+          
+          sampledAvatarEMA <- c(sampledAvatarEMA, weightedAvatarEMA)
+        }
+      }
+    }
+  }
+  
+  result <- tibble(
+    session = session,
+    player = player,
+    round = roundNum,
+    halfLife = halfLife,
+    playerEMA = sampledPlayerEMA,
+    avatarEMA = sampledAvatarEMA,
+    startTime = startTimes,
+    endTime = endTimes,
+    agreement = as.integer(
+      agreement == 1 &
+        seq_along(startTimes) == length(startTimes)
+    )
+  )
+  
+}
+
+masterEMA <- function(id, halfLife=2, riskWindow=0.25, data) {
+  
+  dataPlayer <- data %>%
+    dplyr::filter(
+      playerID == id,
+      is.finite(timestamp),
+      !is.na(avatarSmile),
+      !is.na(Happy)
+    ) %>%
+    dplyr::arrange(timestamp)
+  
+  if (nrow(dataPlayer) == 0L) {
+    stop("No usable observations for playerID: ", id)
+  }
+  
+  session   <- dataPlayer$session[1]
+  player    <- dataPlayer$player[1]
+  roundNum  <- dataPlayer$round[1]
+  roundTime <- dataPlayer$roundTime[1]
+  agreement <- dataPlayer$agreement[1]
+  
+  do.call(
+    dplyr::bind_rows,
+    lapply(
+      halfLife,
+      smoothTs,
+      riskWindow=riskWindow,
+      df=dataPlayer,
+      session=session,
+      player=player,
+      roundNum=roundNum,
+      roundTime=roundTime, 
+      agreement=agreement
+    )
+  )
+}  
+```
+
+```{r}
+
+inferenceData <- inferenceData %>%
+  arrange(
+    session, player, round, timestamp
+  ) %>%
+  mutate(
+    playerID = paste0(session, player, round)
+  )
+
+uniqueIDs <- unique(inferenceData$playerID)
+
+smileLong <- do.call(
+  dplyr::bind_rows,
+  pbmclapply(
+    uniqueIDs,
+    masterEMA,
+    halfLife = c(1, 2, 5, 10, 20),
+    riskWindow = 0.25,
+    data = inferenceData,
+    mc.cores = 15
+  )
+)
+
+smileLong <- smileLong %>%
+  pivot_wider(
+    id_cols = c(session, player, round, startTime, endTime, agreement),
+    names_from = halfLife,
+    values_from = c(playerEMA, avatarEMA),
+    names_glue = "{.value}_HL{halfLife}s"
+  )
+
+saveRDS(smileLong, file = "../Datasets/dataAvatarLongSmiles.rds")
+```
+
+## Plot
+
+```{r}
+
+quantize <- 2 # 0.5 seconds
+
+dataTrajectory <- inferenceData %>%
+  dplyr::filter( !( is.na(experimental) | is.na(avatarSmile) | is.na(Happy) ) ) %>%
+  mutate(
+    timestamp = ceiling(timestamp*quantize)
+  ) %>%
+  group_by(session, player, round, timestamp) %>%
+  summarise(
+    Start = first(timestamp)/quantize,
+    Agreement = first(timestamp)/quantize - first(roundTime),
+    Avatar = mean(avatarSmile),
+    Participant = mean(Happy),
+    Experimental = first(experimental)
+  ) %>%
+  ungroup() %>%
+  pivot_longer(
+    cols = c(Start, Agreement),
+    names_to = "Center",
+    values_to = "Timestamp"
+  ) %>%
+  pivot_longer(
+    cols = c(Avatar, Participant),
+    names_to = "Individual",
+    values_to = "Smile"
+  ) %>%
+  mutate(
+    Center = as.factor(Center)
+  )
+  
+smileTrajectoryPlot <- ggplot(
+  data = dataTrajectory,
+  aes(x = Timestamp, y = Smile, group = Individual, color = Individual, fill = Individual)
+) +
+  geom_jitter(
+    size = 0.05, 
+    alpha = 0.1,
+    show.legend = FALSE
+  ) +
+  geom_hline(
+    data = dataTrajectory %>%
+      group_by(Center, Experimental, Individual) %>%
+      summarise(meanSmile = mean(Smile, na.rm = TRUE), .groups = "drop"),
+    aes(yintercept = meanSmile, color = Individual),
+    linetype = "dashed",
+    linewidth = 0.5,
+    show.legend = FALSE
+#    color = "grey30"
+  ) +
+  geom_smooth(
+    method = "gam",
+    formula = y ~ s(x, bs = "cs", k = 25),
+    method.args = list(method = "REML"),
+    se = FALSE,
+    linewidth = 1,
+    show.legend = FALSE
+  ) +
+  ggh4x::facet_grid2(
+    Center ~ Experimental,
+    scales = "free_x",
+    independent = "x",
+    labeller = labeller(
+      Experimental = c("0" = "Control", "1" = "Treatment")
+    )
+  ) +
+  scale_color_manual(
+    name = "Individual",
+    values = c("Avatar" = "darkgoldenrod1", "Participant" = "dodgerblue2")
+  ) +
+  scale_fill_manual(
+    name = "Individual",
+    values = c("Avatar" = "darkgoldenrod1", "Participant" = "dodgerblue2")
+  ) +
+  coord_cartesian(
+    ylim = c(0, 0.35), 
+    expand = FALSE) +
+  labs(
+#    title = "Treatment differences in smiling trajectories",
+    x = "Round time",
+    y = "Smile"
+  ) +
+  theme_minimal(
+    base_family = "serif",
+    base_size = 10
+  ) +
+#  guides(shape = "none") +
+  theme(
+    panel.spacing = unit(1.5, "lines"),
+    strip.text.x = element_text(size = 9, face = "bold"),
+    strip.text.y = element_blank(),
+    axis.text.x = element_text(
+      angle = 0,
+      hjust = 0.5,
+      size = 8,
+      face = "bold"
+    ),
+    axis.title.x = element_text(
+      size = 9,
+      face = "bold"
+    ),
+    axis.title.y = element_text(
+      size = 9,
+      face = "bold"
+    ),
+    legend.position = "top",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 9),
+    panel.grid.minor = element_blank()
+  )
+
+
+smileTrajectoryPlot
+
+ggsave(
+  "../Plots/smileTrajectoryPlot.pdf",
+  plot = smileTrajectoryPlot,
+  device = "pdf",
+  width = 7,
+  height = 4.6,
+  units = "in",
+  useDingbats = FALSE
+)
+
+ggsave(
+  "../Plots/smileTrajectoryPlot.png",
+  plot = smileTrajectoryPlot,
+  width = 7,
+  height = 4.6,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```

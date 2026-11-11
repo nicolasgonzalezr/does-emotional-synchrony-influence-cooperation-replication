@@ -1,0 +1,3441 @@
+---
+title: "AnalysisF2F"
+format: html
+editor: visual
+---
+
+# Face-to-face bargaining analysis
+
+## Load libraries
+
+```{r}
+
+library(tidyverse)
+library(broom)
+library(fixest)        # Fixed effects regression
+library(survival)      # Cox regression
+library(lavaan)        # SEM
+library(modelsummary)
+library(tinytable)
+library(pbmcapply)     # Parallel
+library(mnormt)        # Multivariate normal draw
+library(ivreg2r)       # robust GMM/2SLS
+```
+
+```{r}
+
+RNGkind("L'Ecuyer-CMRG")
+masterSeed <- 779
+
+parallelSupported <- TRUE
+availableCores <- 15
+M <- 100   # Multiple imputation draws
+```
+
+## Load data
+
+```{r}
+
+typeSelect <- "derivative"
+modelSelect <- "OpenGraphAU"
+signalSelect <- "AU6_AU12"
+
+# ---------------------------- DATA SUMMARY ---------------------------
+
+dataDTW <- readRDS("../Datasets/dataDTW.rds") %>%
+  dplyr::filter(type == typeSelect & model == modelSelect & signal == signalSelect)
+
+dataSmiles <- readRDS("../Datasets/dataSignals.rds") %>%
+  dplyr::filter(model == modelSelect & signal == signalSelect)
+
+dataSignals <- full_join(dataDTW, dataSmiles, by = "dyadID", suffix = c("DTW", ""))
+
+dataF2F <- readRDS("../Datasets/dataF2F.rds") %>%
+  mutate(
+    fixedEffectsID = paste0(session, player, match),
+    openingDistance = openingOffer + opponentOpeningOffer - 18,
+    dyadID = interaction(session, round, group, drop = TRUE),
+    conflictLow = 1 - conflictHigh,
+    conceded = ifelse(agreement==1 & roundPayoff < 9000, 1, 0)
+  ) %>%
+  group_by(session, player, match) %>%
+  arrange(round, .by_group = TRUE) %>%
+  mutate(
+    owed = ifelse(round %% 2 == 0 & first(roundPayoff) > 9000, 1, 0)
+  ) %>%
+  ungroup() %>%
+  group_by(fixedEffectsID) %>%
+  mutate(
+    stratumEventTime = ifelse(
+      max(agreement)==1, # At least one round of the match ended in agreement
+      min(roundTime),    # Time of the first event in the risk set (match)
+      NA
+    ),
+    eventRound = ifelse(
+      !is.na(stratumEventTime),
+      as.numeric(roundTime == stratumEventTime),
+      NA
+    )
+  ) %>%
+  ungroup() %>%
+  left_join(., dataSignals, by=join_by(session, player, opponent, dyadID, round)) %>%
+  mutate(
+    sync=-as.numeric(scale(valueDTW)),
+    logSync=-log(valueDTW),
+    pseudoSync=-as.numeric(scale(pseudo)),
+    logPseudoSync=-log(pseudo),
+    smile = if(signalSelect == "AU6_AU12") value / sqrt(2) * 10 else value * 10, # Normalize
+    opponentSmile = if(signalSelect == "AU6_AU12") opponentValue * 10 else opponentValue / sqrt(2) * 10, # Normalize
+    meanSmile = (smile + opponentSmile) / 2,
+    logTime = log(roundTime),
+    roundTime10s = roundTime/10
+  )
+
+# ------------------------------ DATA LONG ---------------------------------
+
+dataLongDTW <- readRDS("../Datasets/dataLongDTW.rds") %>%
+  dplyr::filter(type == typeSelect & model == modelSelect & signal == signalSelect)
+
+dataSmilesLong <- readRDS("../Datasets/dataSignalsLong.rds") %>%
+  dplyr::filter(model == modelSelect & signal == signalSelect) %>%
+  left_join(dataSmiles, by=c("session", "player", "opponent", "dyadID", "round", "model", "signal"))
+
+by <- join_by(dyadID, startTime, endTime, agreement)
+
+dataSignalsLong <- full_join(dataLongDTW, dataSmilesLong, by = by, suffix = c("DTW", ""))
+
+dataLongF2F <- readRDS("../Datasets/dataF2F.rds") %>%
+  mutate(
+    fixedEffectsID = paste0(session, player, match),
+    openingDistance = openingOffer + opponentOpeningOffer - 18,
+    dyadID = interaction(session, round, group, drop = TRUE),
+    conflictLow = 1 - conflictHigh,
+    conceded = ifelse(agreement==1 & roundPayoff < 9000, 1, 0)
+  ) %>%
+  group_by(session, player, match) %>%
+  arrange(round, .by_group = TRUE) %>%
+  mutate(
+    owed = ifelse(round %% 2 == 0 & first(roundPayoff) > 9000, 1, 0)
+  ) %>%
+  ungroup() %>%
+  group_by(fixedEffectsID) %>%
+  mutate(
+    stratumEventTime = ifelse(
+      max(agreement)==1, # At least one round of the match ended in agreement
+      min(roundTime),    # Time of the first event in the risk set (match)
+      NA
+    ),
+    eventRound = ifelse(
+      !is.na(stratumEventTime),
+      as.numeric(roundTime == stratumEventTime),
+      NA
+    )
+  ) %>%
+  ungroup() %>%
+  select(-c(agreement, roundStart, roundEnd)) %>%
+  left_join(., dataSignalsLong, by=join_by(session, player, opponent, dyadID, round)) %>%
+  mutate(
+    sync=-as.numeric(scale(valueEMADTW)),
+    logSync=-log(valueEMADTW),
+    pseudoSync=-as.numeric(scale(pseudo)),
+    logPseudoSync=-log(pseudo),
+    smile = if(signalSelect == "AU6_AU12") value / sqrt(2) * 10 else value * 10, # Normalize
+    opponentSmile = if(signalSelect == "AU6_AU12") opponentValue * 10 else opponentValue / sqrt(2) * 10, # Normalize
+    meanSmile = (value + opponentValue) / 2,
+    period = cut(
+      endTime,
+      breaks = c(-Inf, 10, 30, Inf),
+      labels = c("early", "middle", "late")
+    ),
+    logTime = log(roundTime),
+    roundTime10s = roundTime/10
+  )
+
+dataConstants <- readRDS("../Datasets/dataConstants.rds")
+```
+
+```{r}
+
+dataF2F %>%
+  select(
+    meanSmile,
+    sync,
+    logSync,
+    pseudoSync,
+    logPseudoSync
+  ) %>%
+  cor(use="pairwise.complete.obs")
+```
+
+## CFA
+
+### Congenial measurement
+
+```{r}
+
+fixedMeasurementFun <- function(i, parameterTable, digits=10) {
+  
+  lhs <- parameterTable[i, "lhs"]
+  
+  par <- round(parameterTable[i,"est"], digits = digits)
+  
+  if (parameterTable[i,"op"] == "~1") {
+    string <- paste(lhs, "~", par, "*", 1)
+    return(string)
+  } else {
+    string <- paste(lhs, parameterTable[i, "op"], par, "*", parameterTable[i, "rhs"])
+    return(string)
+  }
+}
+
+extraMeasurementFun <- function(lvNames, covariates, binary, data) {
+  
+  extraMeasurement <- paste(
+    c(
+      paste0(lvNames, " ~~ ", paste(covariates, collapse= " + "), " \n "),
+      paste0(
+        covariates[-length(covariates)], " ~~ ", 
+        sapply(
+          seq_len(length(covariates) - 1), 
+          function(i) {
+            paste(covariates[(i+1):length(covariates)], collapse=" + ")
+          }
+        ), 
+        " \n "
+      )
+    ),
+    collapse=""
+  )
+  
+  binaryStrings <- sapply(
+    binary,
+    function(j) {
+      sampleAverage <- mean(data[[j]], na.rm=TRUE)
+      sampleVariance <- sampleAverage * (1 - sampleAverage)
+      
+      string <- paste(
+        paste(j, "~",  sampleAverage, "*1"),
+        paste(j, "~~", sampleVariance, "*", j),
+        sep = "\n"
+      )
+      return(string)
+    }
+  )
+  
+  return(paste(extraMeasurement, paste(binaryStrings, collapse = " \n "), sep=" \n "))
+}
+
+
+congenialCoxFun <- function(measurementFit, idCols, longCols, covariates, binary, data, dataLong) {
+  
+  dataFit <- lavInspect(measurementFit, "data")
+  
+  caseIndices <- lavInspect(measurementFit, "case.idx")
+  
+  dataIDs <- cbind(
+    dataFit,
+    data[caseIndices, idCols]
+  )
+  
+  dataFit <- data[, c(idCols, covariates)] %>%
+    right_join(
+      dataIDs,
+      by=idCols
+    )
+  
+  dataLongFit <- dataLong[, c(idCols, longCols, covariates)] %>%
+    group_by(fixedEffectsID) %>%
+    dplyr::filter(
+      startTime < stratumEventTime & stratumEventTime <= endTime
+    ) %>%
+    ungroup() %>%
+    right_join(
+      dataIDs,
+      by=idCols
+    )
+  
+  parameterTable <- parameterEstimates(measurementFit)
+  
+  fixedMeasurementBlock <- sapply(
+    X = 1:nrow(parameterTable),
+    FUN = fixedMeasurementFun,
+    parameterTable = parameterTable,
+    digits=10
+  ) %>%
+    paste(collapse = " \n ")  
+  
+  lvNames <- lavNames(measurementFit, type = "lv")
+  
+  expandedModel <- paste(
+    fixedMeasurementBlock,
+    extraMeasurementFun(lvNames, covariates, binary, dataFit),
+    sep = "\n"
+  )
+  
+  expandedModelLong <- paste(
+    fixedMeasurementBlock,
+    extraMeasurementFun(lvNames, covariates, binary, dataLongFit),
+    sep = "\n"
+  )
+  
+  congenialFit <- cfa(
+    expandedModel,  
+    estimator = "ML",
+    missing = "fiml",
+    meanstructure = TRUE,
+    std.lv = FALSE,
+    se = "none",
+#    cluster = "clusterID",
+    data = dataFit
+  )
+  
+  congenialLongFit <- cfa(
+    expandedModelLong,  
+    estimator = "ML",
+    missing = "fiml",
+    meanstructure = TRUE,
+    std.lv = FALSE,
+    se = "none",
+#    cluster = "clusterID",
+    data = dataLongFit
+  )
+  
+  return(
+    list(
+    congenial     = congenialFit,
+    data          = dataFit,
+    congenialLong = congenialLongFit,
+    dataLong      = dataLongFit
+    )
+  )
+}
+
+congenialLinearFun <- function(measurementFit, idCols, longCols, covariates, binary, data, dataLong) {
+  
+  dataFit <- lavInspect(measurementFit, "data")
+  
+  caseIndices <- lavInspect(measurementFit, "case.idx")
+  
+  dataIDs <- cbind(
+    dataFit,
+    data[caseIndices, idCols]
+  )
+  
+  dataFit <- data[, c(idCols, covariates)] %>%
+    right_join(
+      dataIDs,
+      by=idCols
+    )
+  
+  dataLongFit <- dataLong[, c(idCols, longCols, covariates)] %>%
+    group_by(session, player, round) %>%
+    dplyr::filter(
+      endTime == max(endTime)
+    ) %>%
+    ungroup() %>%
+    right_join(
+      dataIDs,
+      by=idCols
+    )
+  
+  parameterTable <- parameterEstimates(measurementFit)
+  
+  fixedMeasurementBlock <- sapply(
+    X = 1:nrow(parameterTable),
+    FUN = fixedMeasurementFun,
+    parameterTable = parameterTable,
+    digits=10
+  ) %>%
+    paste(collapse = " \n ")  
+  
+  lvNames <- lavNames(measurementFit, type = "lv")
+  
+  expandedModel <- paste(
+    fixedMeasurementBlock,
+    extraMeasurementFun(lvNames, covariates, binary, dataFit),
+    sep = "\n"
+  )
+  
+  expandedModelLong <- paste(
+    fixedMeasurementBlock,
+    extraMeasurementFun(lvNames, covariates, binary, dataLongFit),
+    sep = "\n"
+  )
+  
+  congenialFit <- cfa(
+    expandedModel,  
+    estimator = "ML",
+    missing = "fiml",
+    meanstructure = TRUE,
+    std.lv = FALSE,
+    se = "none",
+    #    cluster = "clusterID",
+    data = dataFit
+  )
+  
+  congenialLongFit <- cfa(
+    expandedModelLong,  
+    estimator = "ML",
+    missing = "fiml",
+    meanstructure = TRUE,
+    std.lv = FALSE,
+    se = "none",
+    #    cluster = "clusterID",
+    data = dataLongFit
+  )
+  
+  return(
+    list(
+      congenial     = congenialFit,
+      data          = dataFit,
+      congenialLong = congenialLongFit,
+      dataLong      = dataLongFit
+    )
+  )
+}
+```
+
+### Congenial draw
+
+```{r}
+
+plausibleDrawFun <- function(measurementFit) {
+  
+  factorScores <- lavPredict(
+    measurementFit,
+    method = "regression",
+    acov = "standard",
+    transform = FALSE
+  )
+  
+  dataPatterns <- lavInspect(measurementFit, "data") 
+  dataPatterns <- 1L * !is.na(dataPatterns)
+  
+  patterns <- lavInspect(measurementFit, "patterns")
+  
+  patternVec <- integer(nrow(dataPatterns))
+  
+  for (i in seq_len(nrow(patterns))) {
+    rowMatches <- rowSums(
+      abs(sweep(dataPatterns, 2, patterns[i, ], FUN = "-"))
+    ) == 0
+    
+    patternVec[rowMatches] <- i
+  }
+  
+  stopifnot(
+    length(patternVec) == nrow(factorScores),
+    all(patternVec > 0L)
+  )
+  
+  acov <- attr(factorScores, "acov")[[1]]
+  
+  plausibleDraw <- do.call(
+    rbind,
+    lapply(
+      seq_len(nrow(factorScores)),
+      function(i) {
+        drop(
+          mnormt::rmnorm(
+            n = 1,
+            mean = factorScores[i, ],
+            varcov = acov[[patternVec[i]]]
+          )
+        )
+      }
+    )
+  )
+  
+  colnames(plausibleDraw) <- colnames(factorScores)
+  
+  return(plausibleDraw)
+}
+```
+
+### SIS
+
+```{r}
+
+#  mutualDependence =~ SIS_MD1 + SIS_MD2
+
+cfaModelSIS <- '
+
+  conflict =~ SIS_C1 + SIS_C2
+  
+  informationCertainty =~ SIS_IC1 + SIS_IC2
+  
+'
+
+linearCfaFitSIS <- cfa(
+  cfaModelSIS, 
+  estimator = "MLR",
+  missing = "fiml",
+  std.lv = TRUE,
+  meanstructure = TRUE,
+  cluster = "clusterID", 
+  dataF2F
+)
+
+summary(linearCfaFitSIS, standardized = TRUE, fit.measures=TRUE)
+
+#ordinalCfaFitSIS <- cfa(
+#  cfaModelSIS, 
+#  estimator = "WLSMV",
+#  ordered = c("SIS_C1", "SIS_C2", "SIS_IC1", "SIS_IC2", "SIS_MD1", "SIS_MD2"),
+#  parameterization = "theta",
+#  dataF2F
+#)
+
+#summary(ordinalCfaFitSIS, standardized = TRUE, fit.measures=TRUE)
+```
+
+```{r}
+
+idCols <- c(
+  "session",
+  "player",
+  "round",
+  "fixedEffectsID",
+  "clusterID"
+)
+
+longCols <- c(
+  "startTime",
+  "endTime",
+  "stratumEventTime"
+)
+
+covariates <- c(
+  "roundTime10s",
+  "logTime",
+  "eventRound",
+  "smile", 
+  "opponentSmile", 
+  "logSync",
+  "logPseudoSync",
+  "conflictLow",
+  "stepSize",
+  "secondRound",
+  "conceded",
+  "owed",
+  "openingOffer",
+  "opponentOpeningOffer"
+)
+
+binary <- c(
+  "eventRound",
+  "conflictLow",
+  "secondRound",
+  "conceded",
+  "owed"
+)
+
+congenialCoxList <- congenialCoxFun(
+  measurementFit = linearCfaFitSIS,
+  idCols = idCols,
+  longCols = longCols,
+  covariates = covariates,
+  binary = binary,
+  data = dataF2F,
+  dataLong = dataLongF2F
+)
+
+congenialLinearList <- congenialLinearFun(
+  measurementFit = linearCfaFitSIS,
+  idCols = idCols,
+  longCols = longCols,
+  covariates = covariates,
+  binary = binary,
+  data = dataF2F,
+  dataLong = dataLongF2F
+)
+```
+
+```{r}
+
+factorScores <- lavPredict(congenialLinearList[["congenial"]], method = "Regression", transform = FALSE)
+
+indices <- lavInspect(congenialLinearList[["congenial"]], "case.idx")
+
+dataFS <- cbind(
+  congenialLinearList[["data"]][indices, c("session", "player", "round")],
+  factorScores
+) %>%
+  right_join(dataF2F, by=c("session", "player", "round"))
+
+factorScoresLong <- lavPredict(congenialLinearList[["congenialLong"]], method = "Regression", transform = FALSE)
+
+indicesLong <- lavInspect(congenialLinearList[["congenialLong"]], "case.idx")
+
+dataLongFS <- cbind(
+  congenialLinearList[["dataLong"]][indicesLong, c("session", "player", "round")],
+  factorScoresLong
+) %>%
+  right_join(dataLongF2F, by=c("session", "player", "round"))
+```
+
+```{r}
+
+#  mutualDependence =~ SIS_MD1 + SIS_MD2
+#  conflict =~ SIS_C1 + SIS_C2
+#  informationCertainty =~ SIS_IC1 + SIS_IC2
+#  power =~ SIS_P1 + SIS_P2
+#  beliefs =~ Beliefs_1 + Beliefs_2
+```
+
+## Smiles
+
+### Descriptives
+
+```{r}
+#| eval: false
+#| include: false
+
+ggplot(data=dataFS, aes(x=roundTime, y=smile)) +
+  geom_jitter(color="springgreen4")+
+  geom_smooth(color="springgreen4")+
+  theme_minimal()
+
+ggplot(data=dataFS, aes(x=smile)) +
+  geom_histogram(bins=100, fill="springgreen4")+
+  theme_minimal()
+
+ggplot(data=dataFS, aes(x=smile)) +
+  geom_density(color="springgreen4")+
+  theme_minimal()
+
+ggplot(data=dataFS, aes(x=sync)) +
+  geom_histogram(bins=100, fill="plum4")+
+  theme_minimal()
+
+ggplot(data=dataFS, aes(x=sync)) +
+  geom_density(color="plum4")+
+  theme_minimal()
+
+ggplot(data=dataFS, aes(x=logSync)) +
+  geom_histogram(bins=100, fill="firebrick")+
+  theme_minimal()
+
+ggplot(data=dataFS, aes(x=logSync)) +
+  geom_density(color="firebrick")+
+  theme_minimal()
+
+ggplot(data=dataFS, aes(x=pseudoSync)) +
+  geom_histogram(bins=100, fill="lightcoral")+
+  theme_minimal()
+
+ggplot(data=dataFS, aes(x=pseudoSync)) +
+  geom_density(color="lightcoral")+
+  theme_minimal()
+
+ggplot(data=dataFS, aes(x=logPseudoSync)) +
+  geom_histogram(bins=100, fill="goldenrod1")+
+  theme_minimal()
+
+ggplot(data=dataFS, aes(x=logPseudoSync)) +
+  geom_density(color="goldenrod1")+
+  theme_minimal()
+```
+
+Plot relationship between synchrony and smiling
+
+```{r}
+#| eval: false
+#| include: false
+
+ggplot(dataFS, aes(x=meanSmile, y=sync))+
+  geom_smooth(method="gam", se=TRUE, formula = y ~ s(x, k = 3), color="springgreen4", fill="springgreen4")+
+  geom_point(color="springgreen4")+
+  theme_minimal()
+
+ggplot(dataFS, aes(x=meanSmile, y=logSync))+
+  geom_smooth(method="gam", se=TRUE, formula = y ~ s(x, k = 3), color="plum4", fill="plum4")+
+  geom_point(color="plum4")+
+  theme_minimal()
+
+ggplot(dataFS, aes(x=meanSmile, y=logPseudoSync))+
+  geom_smooth(method="gam", se=TRUE, formula = y ~ s(x, k = 3), color="steelblue", fill="steelblue")+
+  geom_point(color="steelblue")+
+  theme_minimal()
+
+ggplot(dataFS, aes(x=sync, y=pseudoSync))+
+  geom_smooth(method="gam", se=TRUE, formula = y ~ s(x, k = 3), color="darkgoldenrod1", fill="darkgoldenrod1")+
+  geom_point(color="darkgoldenrod1")+
+  theme_minimal()
+
+ggplot(dataFS, aes(x=logSync, y=logPseudoSync))+
+  geom_smooth(method="gam", se=TRUE, formula = y ~ s(x, k = 3), color="darkgoldenrod1", fill="darkgoldenrod1")+
+  geom_point(color="darkgoldenrod1")+
+  theme_minimal()
+
+ggplot(dataFS, aes(x=logSync, y=pseudoSync))+
+  geom_smooth(method="gam", se=TRUE, formula = y ~ s(x, k = 3), color="darkgoldenrod1", fill="darkgoldenrod1")+
+  geom_point(color="darkgoldenrod1")+
+  theme_minimal()
+
+ggplot(dataFS, aes(x=meanSmile, y=roundTime))+
+  geom_smooth(method="gam", se=TRUE, formula = y ~ s(x, k = 3), color="seagreen", fill="seagreen")+
+  geom_point(color="seagreen")+
+  theme_minimal()
+
+smileSyncModel <- lm(logSync ~ meanSmile, data=dataFS)
+
+summary(smileSyncModel)
+
+smileSyncModel <- lm(logSync ~ meanSmile + I(meanSmile^2), data=dataFS)
+
+summary(smileSyncModel)
+
+
+smilePseudoModel <- lm(logPseudoSync ~ meanSmile, data=dataFS)
+
+summary(smilePseudoModel)
+
+smilePseudoModel <- lm(logPseudoSync ~ meanSmile + I(meanSmile^2), data=dataFS)
+
+summary(smilePseudoModel)
+
+
+syncModel <- lm(logSync ~ logPseudoSync, data=dataFS)
+
+summary(syncModel)
+
+syncModel <- lm(logSync ~ logPseudoSync + I(logPseudoSync^2), data=dataFS)
+
+summary(syncModel)
+```
+
+```{r}
+#| eval: false
+#| include: false
+
+ggplot(dataLongF2F, aes(x=smile, y=logSync))+
+  geom_point(color="plum4", size=0.05, alpha=0.05)+
+  geom_smooth(method="gam", se=TRUE, formula = y ~ s(x, k = 3), color="plum4", fill="plum4")+
+  theme_minimal()
+
+ggplot(dataLongF2F, aes(x=smile, y=logPseudoSync))+
+  geom_point(color="steelblue", size=0.05, alpha=0.05)+
+  geom_smooth(method="gam", se=TRUE, formula = y ~ s(x, k = 3), color="steelblue", fill="steelblue")+
+  theme_minimal()
+
+ggplot(dataLongF2F, aes(x=sync, y=pseudoSync))+
+  geom_point(color="darkgoldenrod1", size=0.05, alpha=0.05)+
+  geom_smooth(method="gam", se=TRUE, formula = y ~ s(x, k = 3), color="darkgoldenrod1", fill="darkgoldenrod1")+
+  theme_minimal()
+
+ggplot(dataLongF2F, aes(x=logSync, y=logPseudoSync))+
+  geom_point(color="darkgoldenrod1", size=0.05, alpha=0.05)+
+  geom_smooth(method="gam", se=TRUE, formula = y ~ s(x, k = 3), color="darkgoldenrod1", fill="darkgoldenrod1")+
+  theme_minimal()
+
+ggplot(dataLongF2F, aes(x=logSync, y=pseudoSync))+
+  geom_point(color="darkgoldenrod1", size=0.05, alpha=0.05)+
+  geom_smooth(method="gam", se=TRUE, formula = y ~ s(x, k = 3), color="darkgoldenrod1", fill="darkgoldenrod1")+
+  theme_minimal()
+
+
+smileSyncModel <- lm(logSync ~ smile + opponentSmile, data=dataLongF2F)
+
+summary(smileSyncModel)
+
+smileSyncModel <- lm(logSync ~ smile + I(smile^2) + opponentSmile + I(opponentSmile^2), data=dataLongF2F)
+
+summary(smileSyncModel)
+
+smilePseudoModel <- lm(logPseudoSync ~ smile + opponentSmile, data=dataLongF2F)
+
+summary(smilePseudoModel)
+
+smilePseudoModel <- lm(logPseudoSync ~ smile + I(smile^2) + opponentSmile + I(opponentSmile^2), data=dataLongF2F)
+
+summary(smilePseudoModel)
+
+syncModel <- lm(logSync ~ logPseudoSync, data=dataLongF2F)
+
+summary(syncModel)
+
+syncModel <- lm(logSync ~ logPseudoSync + I(logPseudoSync^2), data=dataLongF2F)
+
+summary(syncModel)
+```
+
+## Plausible functions
+
+### Process
+
+```{r}
+
+plausibleProcessFun <- function(plausibleFit) {
+  
+  processed <- plausibleFit %>%
+    group_by(Response, Model, Type, Panel, Term) %>%
+    summarise(
+      M = n(),
+      Estimate = if (
+        first(Panel) == "Coefficients" ||
+        first(Term) %in% c("Concordance", "Nagelkerke R2", "R2")
+      ) {
+        mean(coef, na.rm = TRUE)
+      } else {
+        first(coef)
+      },
+      WithinVar = if (first(Panel) == "Coefficients") {
+        mean(se^2, na.rm = TRUE)
+      } else {
+        NA_real_
+      },
+      BetweenVar = if (first(Panel) == "Coefficients") {
+        var(coef, na.rm = TRUE)
+      } else {
+        NA_real_
+      },
+      .groups = "drop"
+    ) %>%
+    mutate(
+      TotalVar = ifelse(Panel == "Coefficients", WithinVar + (1 + 1/M) * BetweenVar, NA),
+      SE = ifelse(Panel == "Coefficients", sqrt(TotalVar), NA),
+      Z = ifelse(Panel == "Coefficients", Estimate / SE, NA),
+      P = ifelse(Panel == "Coefficients", 2 * pnorm(abs(Z), lower.tail = FALSE), NA)
+    )
+  
+  return(processed)
+}
+```
+
+### Cox
+
+```{r}
+
+coxExtractor <- function(data, predictors, varying = FALSE) {
+  
+  modelVariables <- predictors[
+    !grepl("^(strata|cluster|tt)\\(", predictors)
+  ]
+  
+  used <- data %>%
+    dplyr::filter(
+      if_all(all_of(modelVariables), ~ !is.na(.x))
+    )
+  
+  if ("strata(fixedEffectsID)" %in% predictors) {
+    
+    used <- used %>%
+      group_by(fixedEffectsID)
+    
+    if (varying) {
+      used <- used %>%
+        dplyr::filter(
+          startTime < stratumEventTime,
+          stratumEventTime <= endTime
+        )
+    }
+    
+    used <- used %>%
+      dplyr::filter(
+        any(agreement == 1),
+        n() == 2
+      ) %>%
+      ungroup()
+    
+    return(
+      list(
+        risk = n_distinct(
+          used$session,
+          used$player,
+          used$round
+        ),
+        strata = n_distinct(used$fixedEffectsID),
+        clusters = n_distinct(used$clusterID)
+      )
+    )
+  }
+  
+  list(
+    risk = n_distinct(
+      used$session,
+      used$player,
+      used$round
+    ),
+    strata = 1L,
+    clusters = n_distinct(used$clusterID)
+  )
+}
+  
+
+plausibleCoxFun <- function(draw, predictors, timeFun, measurementList, modelName, data, dataLong = NULL, masterSeed) {
+  
+  set.seed(masterSeed + draw)
+  
+  PVs <- plausibleDrawFun(measurementList[["congenial"]])
+  
+  indices <- lavInspect(measurementList[["congenial"]], "case.idx")
+  
+  dataPV <- cbind(
+    measurementList[["data"]][indices, c("session", "player", "round")],
+    PVs
+  ) %>%
+    right_join(data, by=c("session", "player", "round"))
+  
+  syntax <- paste0("Surv(roundTime, agreement) ~ ", paste(predictors, collapse=" + "))
+  
+  coxFit <- coxph(
+    as.formula(syntax),
+    data = dataPV,
+    ties = "efron",
+    tt = timeFun
+  )
+  
+  coxGrouping <- coxExtractor(data=dataPV, predictors=predictors, varying=FALSE)
+  nRisk <- coxGrouping[["risk"]]
+  nStrata <- coxGrouping[["strata"]]
+  nClusters <- coxGrouping[["clusters"]]
+  rsq <- summary(coxFit)$rsq
+  r2 <- unname(rsq["rsq"] / rsq["maxrsq"])
+  
+  modelTable <- as.data.frame(summary(coxFit)$coefficients) %>%
+    tibble::rownames_to_column("Term") %>%
+    rename(
+      se = `robust se`,
+    ) %>%
+    mutate(
+      Response="Agreement",
+      Model=modelName,
+      Type="Constant",
+      Panel="Coefficients"
+    ) %>%
+    select(Response, Model, Type, Panel, Term, coef, se) %>%
+    dplyr::bind_rows(
+      tibble(
+        Response="Agreement",
+        Model=modelName,
+        Type="Constant",
+        Panel="Info",
+        Term=c("Concordance", "Nagelkerke R2", "N", "Events", "Strata", "Clusters"),
+        coef=c(coxFit$concordance[["concordance"]], r2, nRisk, coxFit$nevent, nStrata, nClusters),
+        se=c(coxFit$concordance[["std"]], rep(NA_real_, times=5))
+      )
+    )
+  
+  if(!is.null(dataLong)) {
+    
+    longPVs <- plausibleDrawFun(measurementList[["congenialLong"]])
+    
+    indicesLong <- lavInspect(measurementList[["congenialLong"]], "case.idx")
+    
+    dataLongPV <- cbind(
+      measurementList[["dataLong"]][indicesLong, c("session", "player", "round")],
+      longPVs
+    ) %>%
+      right_join(dataLong, by=c("session", "player", "round"))
+    
+    syntaxLong <- paste0("Surv(startTime, endTime, agreement) ~ ", paste(predictors, collapse=" + "))
+    
+    coxFitLong <- coxph(
+      as.formula(syntaxLong),
+      data = dataLongPV,
+      ties = "efron",
+      tt = timeFun
+    )
+    
+    coxGrouping <- coxExtractor(data=dataLongPV, predictors=predictors, varying=TRUE)
+    nRisk <- coxGrouping[["risk"]]
+    nStrata <- coxGrouping[["strata"]]
+    nClusters <- coxGrouping[["clusters"]]
+    rsq <- summary(coxFitLong)$rsq
+    r2 <- unname(rsq["rsq"] / rsq["maxrsq"])
+    
+    modelLongTable <- as.data.frame(summary(coxFitLong)$coefficients) %>%
+      tibble::rownames_to_column("Term") %>%
+      rename(
+        se = `robust se`,
+      ) %>%
+      mutate(
+        Response="Agreement",
+        Model=modelName,
+        Type="Varying",
+        Panel="Coefficients"
+      ) %>%
+      select(Response, Model, Type, Panel, Term, coef, se) %>%
+      dplyr::bind_rows(
+        tibble(
+          Response="Agreement",
+          Model=modelName,
+          Type="Varying",
+          Panel="Info",
+          Term=c("Concordance", "Nagelkerke R2", "N", "Events", "Strata", "Clusters"),
+          coef=c(coxFitLong$concordance[["concordance"]], r2, nRisk, coxFitLong$nevent, nStrata, nClusters),
+          se=c(coxFitLong$concordance[["std"]], rep(NA_real_, times=5))
+        )
+      )
+    
+    tableOut <- dplyr::bind_rows(modelTable, modelLongTable)
+    return(tableOut)
+    
+  } else {
+    return(modelTable)
+  }
+}
+
+processCoxFun <- function(coxFit, modelName, type, predictors, data) {
+  varying <- type=="Varying"
+  coxGrouping <- coxExtractor(data=data, predictors=predictors, varying=varying)
+  nRisk <- coxGrouping[["risk"]]
+  nStrata <- coxGrouping[["strata"]]
+  nClusters <- coxGrouping[["clusters"]]
+  rsq <- summary(coxFit)$rsq
+  r2 <- unname(rsq["rsq"] / rsq["maxrsq"])
+  
+  processed <- as.data.frame(summary(coxFit)$coefficients) %>%
+    tibble::rownames_to_column("Term") %>%
+    rename(
+      Estimate=coef,
+      SE = `robust se`,
+      Z = z,
+      P = `Pr(>|z|)`
+    ) %>%
+    mutate(
+      Response="Agreement",
+      Model=modelName,
+      Type=type,
+      Panel="Coefficients",
+    ) %>%
+    select(Response, Model, Type, Panel, Term, Estimate, SE, Z, P) %>%
+    dplyr::bind_rows(
+      tibble(
+        Response="Agreement",
+        Model=modelName,
+        Type=type,
+        Panel="Info",
+        Term=c("Concordance", "Nagelkerke R2", "N", "Events", "Strata", "Clusters"),
+        Estimate=c(coxFit$concordance[["concordance"]], r2, nRisk, coxFit$nevent, nStrata, nClusters),
+        SE=c(coxFit$concordance[["std"]], rep(NA_real_, times=5)),
+        Z=NA_real_,
+        P=NA_real_
+      )
+    )
+  
+  return(processed)
+}
+```
+
+### FE
+
+```{r}
+
+plausibleFeolsFun <- function(draw, response, predictors, fixedEffects = 0, cluster, measurementList, modelName, data, dataLong=NULL, masterSeed) {
+  
+  set.seed(masterSeed + draw)
+  
+  PVs <- plausibleDrawFun(measurementList[["congenial"]])
+  
+  indices <- lavInspect(measurementList[["congenial"]], "case.idx")
+  
+  dataPV <- cbind(
+    measurementList[["data"]][indices, c("session", "player", "round")],
+    PVs
+  ) %>%
+    right_join(data, by=c("session", "player", "round"))
+  
+  syntax <- paste0(response, " ~ ", paste(predictors, collapse=" + "), " | ", fixedEffects)
+  
+  modelFE<- feols(
+    as.formula(syntax),
+    cluster = cluster,
+    data = dataPV
+  )
+  
+  r2 <- if (fixedEffects == 0) {
+    as.numeric(fitstat(modelFE, "r2"))
+  } else {
+    as.numeric(fitstat(modelFE, "wr2"))
+  }
+  nClusters <- as.integer(attr(modelFE$cov.scaled, "G"))
+  nFE <- if (length(modelFE$fixef_sizes)) {
+    unname(modelFE$fixef_sizes[[1]])
+  } else {
+    0L
+  }
+  
+  modelTable <- as.data.frame(summary(modelFE)$coeftable) %>%
+    tibble::rownames_to_column("Term") %>%
+    rename(
+      coef = Estimate,
+      se = `Std. Error`
+    ) %>%
+    mutate(
+      Response=response,
+      Model=modelName,
+      Type="Constant",
+      Panel="Coefficients"
+    ) %>%
+    select(Response, Model, Type, Panel, Term, coef, se) %>%
+    dplyr::bind_rows(
+      tibble(
+        Response=response,
+        Model=modelName,
+        Type="Constant",
+        Panel="Info",
+        Term=c("R2", "N", "FE", "Clusters"),
+        coef=c(r2, modelFE$nobs, nFE, nClusters),
+        se=NA_real_
+      )
+    )
+  
+  if(!is.null(dataLong)) {
+    
+    longPVs <- plausibleDrawFun(measurementList[["congenialLong"]])
+    
+    indicesLong <- lavInspect(measurementList[["congenialLong"]], "case.idx")
+    
+    mask <- c("session", "player", "round", setdiff(colnames(data), colnames(measurementList[["dataLong"]])))
+    
+    dataLongPV <- cbind(
+      measurementList[["dataLong"]][indicesLong, ],
+      longPVs
+    ) %>%
+      left_join(
+        data[, mask, drop = FALSE],
+        by=c("session", "player", "round")
+      )
+    
+    syntaxLong <- paste0(response, " ~ ", paste(predictors, collapse=" + "), " | ", fixedEffects)
+    
+    modelLongFE<- feols(
+      as.formula(syntaxLong),
+      cluster = cluster,
+      data = dataLongPV
+    )
+    
+    r2 <- if (fixedEffects == 0) {
+      as.numeric(fitstat(modelLongFE, "r2"))
+    } else {
+      as.numeric(fitstat(modelLongFE, "wr2"))
+    }
+    nClusters <- as.integer(attr(modelLongFE$cov.scaled, "G"))
+    nFE <- if (length(modelLongFE$fixef_sizes)) {
+      unname(modelLongFE$fixef_sizes[[1]])
+    } else {
+      0L
+    }
+    
+    modelLongTable <- as.data.frame(summary(modelLongFE)$coeftable) %>%
+      tibble::rownames_to_column("Term") %>%
+      rename(
+        coef = Estimate,
+        se = `Std. Error`
+      ) %>%
+      mutate(
+        Response=response,
+        Model=modelName,
+        Type="Varying",
+        Panel="Coefficients"
+      ) %>%
+      select(Response, Model, Type, Panel, Term, coef, se) %>%
+      dplyr::bind_rows(
+        tibble(
+          Response=response,
+          Model=modelName,
+          Type="Varying",
+          Panel="Info",
+          Term=c("R2", "N", "FE", "Clusters"),
+          coef=c(r2, modelLongFE$nobs, nFE, nClusters),
+          se=NA_real_
+        )
+      )
+    
+    tableOut <- dplyr::bind_rows(modelTable, modelLongTable)
+    return(tableOut)
+    
+  } else {
+    return(modelTable)
+  }
+  
+}
+```
+
+### SEM
+
+```{r}
+
+checkConvergence <- function(fit) {
+  isTRUE(lavInspect(fit, "converged")) &&
+    isTRUE(lavInspect(fit, "post.check"))
+}
+
+demeanFun <- function(data, idVariables, analysisVariables) {
+  
+  modelVariables <- c(idVariables, analysisVariables)
+  
+  demeanedData <- data %>%
+    dplyr::filter(
+      if_all(all_of(modelVariables), ~ !is.na(.x))
+    ) %>%
+    group_by(fixedEffectsID) %>%
+    dplyr::filter(n() == 2) %>%
+    mutate(
+      across(
+        all_of(analysisVariables) & where(is.numeric),
+        ~ as.numeric(scale(.x, center = TRUE, scale = FALSE))
+      )
+    ) %>%
+    ungroup()
+  
+  return(demeanedData)
+}
+
+plausibleFunSEM <- function(draw, model, measurementList, demean=FALSE, idVariables, analysisVariables, data, masterSeed) {
+  
+  set.seed(masterSeed + draw)
+  
+  PVs <- plausibleDrawFun(measurementList[["congenial"]])
+  
+  indices <- lavInspect(measurementList[["congenial"]], "case.idx")
+  
+  dataPV <- cbind(
+    measurementList[["data"]][indices, c("session", "player", "round")],
+    PVs
+  ) %>%
+    right_join(data, by=c("session", "player", "round"))
+  
+  demeanedPV <- if(demean) {
+    demeanFun(dataPV, idVariables, analysisVariables)
+  } else {
+    dataPV
+  }
+  
+  structuralFit <- sem(
+    model=model,
+    estimator="MLR",
+    meanstructure=TRUE,
+    cluster = "clusterID",
+    data = demeanedPV
+  )
+
+  if (!checkConvergence(structuralFit)) return(NULL)
+  
+  estimates <- parameterEstimates(structuralFit)
+  
+  r2 <- lavInspect(structuralFit, "r2")
+  nobs <- lavInspect(structuralFit, "nobs")
+  nFE <- nobs / 2
+  nClusters <- structuralFit@Data@Lp[[1]]$nclusters[[2]]
+  
+  gofRows <- tibble::tibble(
+    lhs = rep(names(r2), times = 4),
+    op = "gof",
+    rhs = rep(c("R2", "N", "FE", "Clusters"), each = length(r2)),
+    est = c(
+      as.numeric(r2),
+      rep(nobs, length(r2)),
+      rep(nFE, length(r2)),
+      rep(nClusters, length(r2))
+    ),
+    se = NA_real_,
+    z = NA_real_,
+    pvalue = NA_real_,
+    ci.lower = NA_real_,
+    ci.upper = NA_real_
+  )
+
+  estimates <- dplyr::bind_rows(
+    estimates,
+    gofRows,
+  )
+  
+  return(estimates)
+}
+
+
+# -------------------------------- PROCESS RESULTS ------------------------------------
+
+processFunSEM <- function(structuralFit) {
+  
+  processed <- structuralFit %>%
+    dplyr::filter(!is.na(est)) %>%
+    group_by(lhs, op, rhs) %>%
+    summarise(
+      M = n(),
+      Estimate = if (!(first(op) == "gof") || first(rhs) == "R2") {
+        mean(est, na.rm = TRUE)
+      } else {
+        first(est)
+      },
+      WithinVar = if (!(first(op) == "gof")) {
+        mean(se^2, na.rm = TRUE)
+      } else {
+        NA_real_
+      },
+      BetweenVar = if (!(first(op) == "gof")) {
+        var(est, na.rm = TRUE)
+      } else {
+        NA_real_
+      },
+      .groups = "drop"
+    ) %>%
+    mutate(
+      TotalVar = ifelse(!(op == "gof"), WithinVar + (1 + 1/M) * BetweenVar, NA),
+      SE = ifelse(!(op == "gof"), sqrt(TotalVar), NA),
+      Z = ifelse(!(op == "gof"), Estimate / SE, NA),
+      P = ifelse(!(op == "gof"), 2 * pnorm(abs(Z), lower.tail = FALSE), NA),
+    )
+  
+  return(processed)
+  
+}
+```
+
+## Time
+
+### Descriptives
+
+```{r}
+
+ggplot(data=dataF2F, aes(x=roundTime)) +
+  geom_histogram(bins=60, fill="steelblue")+
+  theme_minimal()
+
+ggplot(data=dataF2F, aes(x=roundTime)) +
+  geom_density(color="steelblue")+
+  theme_minimal()
+```
+
+### Design controls
+
+```{r}
+
+predictors <- c(
+  "conflictLow",
+  "stepSize",
+  "secondRound",
+  "round",
+  "cluster(clusterID)"
+)
+
+syntax <- paste0(
+  "Surv(roundTime, agreement) ~ ", paste(predictors, collapse=" + ")
+)
+
+coxDesign <- coxph(
+  as.formula(syntax),
+  data = dataF2F,
+  ties = "efron"
+)
+
+summary(coxDesign)
+
+coxTableDesign <- processCoxFun(coxDesign, modelName="Design", type="Constant", predictors=predictors, data=dataF2F)
+
+coxTableDesign
+```
+
+### Raw effect
+
+```{r}
+
+predictors <- c(
+  "logSync",
+  "logPseudoSync",
+  "conflictLow",
+  "stepSize",
+  "secondRound",
+  "round",
+  "cluster(clusterID)"
+)
+
+syntax <- paste0(
+  "Surv(roundTime, agreement) ~ ", paste(predictors, collapse=" + ")
+)
+
+coxRaw <- coxph(
+  as.formula(syntax),
+  data = dataF2F,
+  ties = "efron"
+)
+
+summary(coxRaw)
+
+syntaxLong <- paste0(
+  "Surv(startTime, endTime, agreement) ~ ", paste(predictors, collapse=" + ")
+)
+
+coxRaw <- coxph(
+  as.formula(syntaxLong),
+  data = dataLongF2F,
+  ties = "efron"
+)
+
+summary(coxRaw)
+
+coxTableRaw <- processCoxFun(coxRaw, modelName="Raw", type="Varying", predictors=predictors, data=dataLongF2F)
+
+coxTableRaw
+```
+
+### Total effect
+
+```{r}
+
+predictors <- c(
+  "logSync",
+  "logPseudoSync",
+  "conflictLow",
+  "stepSize",
+  "secondRound",
+  "cluster(clusterID)",
+  "strata(fixedEffectsID)"
+)
+
+syntax <- paste0(
+  "Surv(roundTime, agreement) ~ ", paste(predictors, collapse=" + ")
+)
+
+coxTotal <- coxph(
+  as.formula(syntax),
+  data = dataF2F,
+  ties = "efron"
+)
+
+summary(coxTotal)
+
+syntaxLong <- paste0(
+  "Surv(startTime, endTime, agreement) ~ ", paste(predictors, collapse=" + ")
+)
+
+coxTotal <- coxph(
+  as.formula(syntaxLong),
+  data = dataLongF2F,
+  ties = "efron"
+)
+
+summary(coxTotal)
+
+coxTableTotal <- processCoxFun(coxTotal, modelName="Total", type="Varying", predictors=predictors, data=dataLongF2F)
+
+coxTableTotal
+```
+
+### Dynamic effects
+
+```{r}
+
+predictors <- c(
+  "logSync",
+  "tt(logSync)",
+  "logPseudoSync",
+  "tt(logPseudoSync)",
+  "conflictLow",
+  "stepSize",
+  "secondRound",
+  "cluster(clusterID)",
+  "strata(fixedEffectsID)"
+)
+
+tt <- function(x, t, ...) {
+  x * log1p(t)
+}
+
+syntax <- paste0(
+  "Surv(roundTime, agreement) ~ ", paste(predictors, collapse=" + ")
+)
+
+coxDynamic <- coxph(
+  as.formula(syntax),
+  data = dataF2F,
+  ties = "efron",
+  tt = tt
+)
+
+summary(coxDynamic)
+
+syntaxLong <- paste0(
+  "Surv(startTime, endTime, agreement) ~ ", paste(predictors, collapse=" + ")
+)
+
+coxDynamic <- coxph(
+  as.formula(syntaxLong),
+  data = dataLongF2F,
+  ties = "efron",
+  tt = tt
+)
+
+summary(coxDynamic)
+
+coxTableDynamic <- processCoxFun(coxDynamic, modelName="Dynamic", type="Varying", predictors=predictors, data=dataLongF2F)
+
+coxTableDynamic
+```
+
+### Covariates
+
+```{r}
+
+predictors <- c(
+  "logSync",
+  "logPseudoSync",
+  "meanSmile",
+  "conflictLow",
+  "stepSize",
+  "secondRound",
+  "openingDistance",
+  "cluster(clusterID)",
+  "strata(fixedEffectsID)"
+)
+
+tt <- function(x, t, ...) {
+  x * log1p(t)
+}
+
+syntax <- paste0(
+  "Surv(roundTime, agreement) ~ ", paste(predictors, collapse=" + ")
+)
+
+coxCovariates <- coxph(
+  as.formula(syntax),
+  data = dataF2F,
+  ties = "efron",
+  tt = tt
+)
+
+summary(coxCovariates)
+
+syntaxLong <- paste0(
+  "Surv(startTime, endTime, agreement) ~ ", paste(predictors, collapse=" + ")
+)
+
+coxCovariates <- coxph(
+  as.formula(syntaxLong),
+  data = dataLongF2F,
+  ties = "efron",
+  tt = tt
+)
+
+summary(coxCovariates)
+
+coxTableCovariates <- processCoxFun(coxCovariates, modelName="Covariates", type="Varying", predictors=predictors, data=dataLongF2F)
+
+coxTableCovariates
+```
+
+### Direct effect
+
+```{r}
+
+predictors <- c(
+  "conflict",
+  "logSync",
+  "logPseudoSync",
+  "meanSmile",
+  "opponentSmile",
+  "conflictLow",
+  "stepSize",
+  "secondRound",
+  "openingDistance",
+  "cluster(clusterID)",
+  "strata(fixedEffectsID)"
+)
+
+tt <- function(x, t, ...) {
+  x * log1p(t)
+}
+
+if (parallelSupported) {
+  coxDirect <- do.call(
+    rbind,
+    pbmcapply::pbmclapply(
+      X = 1:M,
+      FUN = plausibleCoxFun,
+      predictors = predictors,
+      timeFun = tt,
+      measurementList = congenialCoxList,
+      modelName = "Direct",
+      data = dataF2F,
+      dataLong = dataLongF2F,
+      masterSeed = masterSeed,
+      mc.cores = 15,
+      mc.set.seed = TRUE
+    )
+  )
+} else {
+  coxDirect <- do.call(
+    rbind,
+    lapply(
+      X = 1:M,
+      FUN = plausibleCoxFun,
+      predictors = predictors,
+      timeFun = tt,
+      measurementList = congenialCoxList,
+      modelName = "Direct",
+      data = dataF2F,
+      dataLong = dataLongF2F,
+      masterSeed = masterSeed
+    )
+  )
+}
+
+coxTableDirect <- plausibleProcessFun(coxDirect) %>%
+  dplyr::filter(Type=="Varying")
+
+coxTableDirect %>%
+  dplyr::select(Model, Type, Term, Estimate, SE, Z, P) %>%
+  mutate(
+    across(c(Estimate, SE, Z, P), \(x) round(x, digits = 4))
+  )
+```
+
+### Print table
+
+```{r}
+
+termLevels <- c(
+  "conflict",
+  "logSync",
+#  "tt(logSync)",
+  "logPseudoSync",
+#  "tt(logPseudoSync)",
+  "meanSmile",
+#  "tt(meanSmile)",
+#  "smile",
+#  "tt(smile)",
+#  "opponentSmile",
+#  "tt(opponentSmile)",
+  "conflictLow",
+  "stepSize",
+  "secondRound",
+  "round",
+  "openingDistance",
+  "Concordance",
+  "Nagelkerke R2",
+  "N",
+  "Events",
+  "Strata",
+  "Clusters"
+)
+
+termLabels <- c(
+  "Conflict (Z)",
+  "Log smile sync",
+#  "Log smile sync × ln(1+t)",
+  "Log pseudo sync",
+#  "Log pseudo sync × ln(1+t)",
+  "Mean smile (dyad)",
+#  "Mean smile × ln(1+t)",
+#  "Smile",
+#  "Smile × ln(1+t)",
+#  "Opponent smile",
+#  "Opponent smile × ln(1+t)",
+  "Restricted",
+  "Step size",
+  "Second round",
+  "Round",
+  "Opening distance",
+  "Concordance",
+  "Nagelkerke-R²",
+  "N",
+  "Events",
+  "Strata",
+  "Clusters"
+)
+
+modelLevels <- c(
+  "Design", 
+  "Raw",
+  "Total",
+#  "Dynamic",
+  "Covariates",
+  "Direct"
+)
+
+modelLabels <- c(
+  "Design", 
+  "Raw",
+  "Total",
+#  "Dynamic effect",
+  "Covariates",
+  "Direct"
+)
+
+coxTable <- dplyr::bind_rows(
+  coxTableDesign,
+  coxTableRaw,
+  coxTableTotal,
+#  coxTableDynamic,
+  coxTableCovariates,
+  coxTableDirect
+  ) %>%
+  group_by(Response, Model, Type, Panel, Term) %>%
+  mutate(
+    stars = case_when(
+      P <= 0.001 ~ "***",
+      P <= 0.01  ~ "**",
+      P <= 0.05  ~ "*",
+      .default = ""
+    ),
+    pFormatted = if_else(
+      P < 0.001,
+      "&lt;.001",
+      paste0("=", sub("^0", "", sprintf("%.3f", P)))
+    ),
+    Estimate = case_when(
+      Panel == "Coefficients" & !startsWith(Term, "tt") ~ sprintf(
+        paste0(
+          "%.3f%s",
+          "<br><span style='font-size:85%%;font-weight:bold;'>&lang;%.3f&rang;</span>",
+          "<br><span style='font-size:85%%;'>(%.3f)</span>",
+          "<br><span style='font-size:85%%;'>p%s</span>"
+        ),
+        Estimate, stars, exp(Estimate), SE, pFormatted
+      ),
+      Panel == "Coefficients" & startsWith(Term, "tt") ~ sprintf(
+        paste0(
+          "%.3f%s",
+          "<br><span style='font-size:85%%;'>(%.3f)</span>",
+          "<br><span style='font-size:85%%;'>p%s</span>"
+        ),
+        Estimate, stars, SE, pFormatted
+      ),
+      Term %in% c("Concordance", "Nagelkerke R2") ~ sprintf("%.3f", Estimate),
+      .default = sprintf("%.0f", Estimate)
+    ),
+    Model = factor(
+      Model,
+      levels = modelLevels,
+      labels = modelLabels
+    ),
+    Panel = factor(
+      Panel,
+      levels = c("Coefficients", "Info"),
+      labels = c("Coefficients", "Model information")
+    ),
+    Term = factor(
+      Term, 
+      levels = termLevels,
+      labels = termLabels
+    )
+  )
+
+coxTable <- coxTable %>%
+  ungroup() %>%
+  dplyr::filter(Term != "Nagelkerke-R²") %>%
+  dplyr::select(
+    Panel,
+    Term,
+    Model,
+    Estimate
+  ) %>%
+  tidyr::pivot_wider(
+    id_cols = c(Panel, Term),
+    names_from = Model,
+    values_from = Estimate
+  ) %>%
+  arrange(Panel, Term)
+
+coxTable <- dplyr::bind_rows(
+  coxTable %>% dplyr::filter(Panel == "Coefficients"),
+  coxTable %>% dplyr::filter(Panel == "Model information")
+) %>%
+  dplyr::select(-Panel)
+
+coxTableSync <- coxTable %>%
+  filter(
+    !(Term %in% c("Restricted", "Step size", "Second round", "Round", "Opening distance"))
+  )
+
+coxTableDesign <- coxTable %>%
+  filter(
+    !(Term %in% c("Conflict (Z)", "Log smile sync", "Log pseudo sync", "Mean smile (dyad)", "Opening distance"))
+  )
+
+coxGT <- coxTable %>%
+  gt::gt(
+    rowname_col = "Term"
+  ) %>%
+  gt::tab_spanner(
+    label = "Agreement (hazard)",
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::fmt_markdown(
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::cols_align(
+    align = "center",
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::sub_missing(
+    columns = tidyselect::all_of(modelLabels),
+    missing_text = "—"
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(
+      size = gt::px(12),
+      weight = "bold"
+    ),
+    locations = gt::cells_column_spanners(
+      spanners = "Agreement (hazard)"
+    )
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(align = "center"),
+    locations = gt::cells_stubhead()
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_borders(
+      sides = "top",
+      color = "#D3D3D3",
+      weight = gt::px(2)
+    ),
+    locations = list(
+      gt::cells_stub(
+        rows = Term == "Concordance"
+      ),
+      gt::cells_body(
+        rows = Term == "Concordance"
+      )
+    )
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(align = "center"),
+    locations = gt::cells_stub(
+      rows = everything()
+    )
+  ) %>%
+  gt::tab_options(
+    table.font.names = c("Verdana", "Arial", "sans-serif"),
+    table.font.size = gt::px(11),
+    column_labels.font.weight = "bold",
+    column_labels.border.top.width = gt::px(0),
+    column_labels.border.bottom.width = gt::px(1),
+    table_body.hlines.width = gt::px(0),
+    table.width = gt::px(624)
+  )
+
+coxGT <- coxGT %>%
+  gt::tab_options(
+    table.width = gt::px(624)
+  )
+
+gt::gtsave(
+  coxGT,
+  filename = "../Tables/coxTable.png",
+  zoom = 3.125,
+  expand = 0
+)
+
+coxGT
+
+coxDesignGT <- coxTableDesign %>%
+  gt::gt(
+    rowname_col = "Term"
+  ) %>%
+  gt::tab_spanner(
+    label = "Agreement (hazard)",
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::fmt_markdown(
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::cols_align(
+    align = "center",
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::sub_missing(
+    columns = tidyselect::all_of(modelLabels),
+    missing_text = "—"
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(
+      size = gt::px(12),
+      weight = "bold"
+    ),
+    locations = gt::cells_column_spanners(
+      spanners = "Agreement (hazard)"
+    )
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(align = "center"),
+    locations = gt::cells_stubhead()
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_borders(
+      sides = "top",
+      color = "#D3D3D3",
+      weight = gt::px(2)
+    ),
+    locations = list(
+      gt::cells_stub(
+        rows = Term == "Concordance"
+      ),
+      gt::cells_body(
+        rows = Term == "Concordance"
+      )
+    )
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(align = "center"),
+    locations = gt::cells_stub(
+      rows = everything()
+    )
+  ) %>%
+  gt::tab_options(
+    table.font.names = c("Verdana", "Arial", "sans-serif"),
+    table.font.size = gt::px(11),
+    column_labels.font.weight = "bold",
+    column_labels.border.top.width = gt::px(0),
+    column_labels.border.bottom.width = gt::px(1),
+    table_body.hlines.width = gt::px(0),
+    table.width = gt::px(624)
+  )
+
+coxDesignGT <- coxDesignGT %>%
+  gt::tab_options(
+    table.width = gt::px(624)
+  )
+
+gt::gtsave(
+  coxDesignGT,
+  filename = "../Tables/coxDesign.png",
+  zoom = 3.125,
+  expand = 0
+)
+
+coxSyncGT <- coxTableSync %>%
+  gt::gt(
+    rowname_col = "Term"
+  ) %>%
+  gt::tab_spanner(
+    label = "Agreement (hazard)",
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::fmt_markdown(
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::cols_align(
+    align = "center",
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::sub_missing(
+    columns = tidyselect::all_of(modelLabels),
+    missing_text = "—"
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(
+      size = gt::px(12),
+      weight = "bold"
+    ),
+    locations = gt::cells_column_spanners(
+      spanners = "Agreement (hazard)"
+    )
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(align = "center"),
+    locations = gt::cells_stubhead()
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_borders(
+      sides = "top",
+      color = "#D3D3D3",
+      weight = gt::px(2)
+    ),
+    locations = list(
+      gt::cells_stub(
+        rows = Term == "Concordance"
+      ),
+      gt::cells_body(
+        rows = Term == "Concordance"
+      )
+    )
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(align = "center"),
+    locations = gt::cells_stub(
+      rows = everything()
+    )
+  ) %>%
+  gt::tab_options(
+    table.font.names = c("Verdana", "Arial", "sans-serif"),
+    table.font.size = gt::px(11),
+    column_labels.font.weight = "bold",
+    column_labels.border.top.width = gt::px(0),
+    column_labels.border.bottom.width = gt::px(1),
+    table_body.hlines.width = gt::px(0),
+    table.width = gt::px(624)
+  )
+
+coxSyncGT <- coxSyncGT %>%
+  gt::tab_options(
+    table.width = gt::px(624)
+  )
+
+gt::gtsave(
+  coxSyncGT,
+  filename = "../Tables/coxSync.png",
+  zoom = 3.125,
+  expand = 0
+)
+```
+
+### Plot result
+
+## Conflict
+
+### Descriptives
+
+```{r}
+
+ggplot(data=dataFS, aes(x=conflict)) +
+  geom_histogram(bins=13, fill="lightcoral")+
+  theme_minimal()
+
+ggplot(data=dataFS, aes(x=conflict)) +
+  geom_density(color="lightcoral")+
+  theme_minimal()
+```
+
+### Design controls
+
+```{r}
+
+response <- "conflict"
+
+predictors <- c(
+  "conflictLow",
+  "stepSize",
+  "secondRound",
+  "round"
+)
+
+if (parallelSupported) {
+  conflictDesign <- do.call(
+    rbind,
+    pbmcapply::pbmclapply(
+      X = 1:M,
+      FUN = plausibleFeolsFun,
+      response = response,
+      predictors = predictors,
+      fixedEffects = 0,
+      cluster = "clusterID",
+      measurementList = congenialLinearList,
+      modelName = "Design",
+      data = dataF2F,
+      dataLong = dataLongF2F,
+      masterSeed = masterSeed,
+      mc.cores = 15,
+      mc.set.seed = TRUE
+    )
+  )
+} else {
+  conflictDesign <- do.call(
+    rbind,
+    lapply(
+      X = 1:M,
+      FUN = plausibleFeolsFun,
+      response = response,
+      predictors = predictors,
+      fixedEffects = 0,
+      cluster = "clusterID",
+      measurementList = congenialLinearList,
+      modelName = "Design",
+      data = dataF2F,
+      dataLong = dataLongF2F,
+      masterSeed = masterSeed
+    )
+  )
+}
+
+conflictTableDesign <- plausibleProcessFun(conflictDesign)
+
+conflictTableDesign %>%
+  dplyr::select(Model, Type, Term, Estimate, SE, Z, P) %>%
+  mutate(
+    across(c(Estimate, SE, Z, P), \(x) round(x, digits = 4))
+  )
+
+conflictTableDesign <- conflictTableDesign %>%
+  dplyr::filter(Type=="Constant")
+```
+
+### Raw effect
+
+```{r}
+
+response <- "conflict"
+
+predictors <- c(
+  "logSync",
+  "logPseudoSync",
+  "conflictLow",
+  "stepSize",
+  "secondRound",
+  "round"
+)
+
+if (parallelSupported) {
+  conflictRaw <- do.call(
+    rbind,
+    pbmcapply::pbmclapply(
+      X = 1:M,
+      FUN = plausibleFeolsFun,
+      response = response,
+      predictors = predictors,
+      fixedEffects = 0,
+      cluster = "clusterID",
+      measurementList = congenialLinearList,
+      modelName = "Raw",
+      data = dataF2F,
+      dataLong = dataLongF2F,
+      masterSeed = masterSeed,
+      mc.cores = 15,
+      mc.set.seed = TRUE
+    )
+  )
+} else {
+  conflictRaw <- do.call(
+    rbind,
+    lapply(
+      X = 1:M,
+      FUN = plausibleFeolsFun,
+      response = response,
+      predictors = predictors,
+      fixedEffects = 0,
+      cluster = "clusterID",
+      measurementList = congenialLinearList,
+      modelName = "Raw",
+      data = dataF2F,
+      dataLong = dataLongF2F,
+      masterSeed = masterSeed
+    )
+  )
+}
+
+conflictTableRaw <- plausibleProcessFun(conflictRaw)
+
+conflictTableRaw %>%
+  dplyr::select(Model, Type, Term, Estimate, SE, Z, P) %>%
+  mutate(
+    across(c(Estimate, SE, Z, P), \(x) round(x, digits = 4))
+  )
+
+conflictTableRaw <- conflictTableRaw%>%
+  dplyr::filter(Type=="Varying")
+```
+
+### Total effect
+
+```{r}
+
+response <- "conflict"
+
+predictors <- c(
+  "logSync",
+  "logPseudoSync",
+  "conflictLow",
+  "stepSize",
+  "secondRound"
+)
+
+if (parallelSupported) {
+  conflictTotal <- do.call(
+    rbind,
+    pbmcapply::pbmclapply(
+      X = 1:M,
+      FUN = plausibleFeolsFun,
+      response = response,
+      predictors = predictors,
+      fixedEffects = "fixedEffectsID",
+      cluster = "clusterID",
+      measurementList = congenialLinearList,
+      modelName = "Total",
+      data = dataF2F,
+      dataLong = dataLongF2F,
+      masterSeed = masterSeed,
+      mc.cores = 15,
+      mc.set.seed = TRUE
+    )
+  )
+} else {
+  conflictTotal <- do.call(
+    rbind,
+    lapply(
+      X = 1:M,
+      FUN = plausibleFeolsFun,
+      response = response,
+      predictors = predictors,
+      fixedEffects = "fixedEffectsID",
+      cluster = "clusterID",
+      measurementList = congenialLinearList,
+      modelName = "Total",
+      data = dataF2F,
+      dataLong = dataLongF2F,
+      masterSeed = masterSeed
+    )
+  )
+}
+
+conflictTableTotal <- plausibleProcessFun(conflictTotal) %>%
+  dplyr::filter(Type=="Varying")
+
+conflictTableTotal %>%
+  dplyr::select(Model, Type, Term, Estimate, SE, Z, P) %>%
+  mutate(
+    across(c(Estimate, SE, Z, P), \(x) round(x, digits = 4))
+  )
+```
+
+### Covariates
+
+```{r}
+
+response <- "conflict"
+
+predictors <- c(
+  "logSync",
+  "logPseudoSync",
+  "meanSmile",
+  "conflictLow",
+  "stepSize",
+  "secondRound",
+  "openingDistance"
+)
+
+if (parallelSupported) {
+  conflictCovariates <- do.call(
+    rbind,
+    pbmcapply::pbmclapply(
+      X = 1:M,
+      FUN = plausibleFeolsFun,
+      response = response,
+      predictors = predictors,
+      fixedEffects = "fixedEffectsID",
+      cluster = "clusterID",
+      measurementList = congenialLinearList,
+      modelName = "Covariates",
+      data = dataF2F,
+      dataLong = dataLongF2F,
+      masterSeed = masterSeed,
+      mc.cores = 15,
+      mc.set.seed = TRUE
+    )
+  )
+} else {
+  conflictCovariates <- do.call(
+    rbind,
+    lapply(
+      X = 1:M,
+      FUN = plausibleFeolsFun,
+      response = response,
+      predictors = predictors,
+      fixedEffects = "fixedEffectsID",
+      cluster = "clusterID",
+      measurementList = congenialLinearList,
+      modelName = "Covariates",
+      data = dataF2F,
+      dataLong = dataLongF2F,
+      masterSeed = masterSeed
+    )
+  )
+}
+
+conflictTableCovariates <- plausibleProcessFun(conflictCovariates)
+
+conflictTableCovariates %>%
+  dplyr::select(Model, Type, Term, Estimate, SE, Z, P) %>%
+  mutate(
+    across(c(Estimate, SE, Z, P), \(x) round(x, digits = 4))
+  )
+
+conflictTableCovariates <- conflictTableCovariates %>%
+  dplyr::filter(Type=="Varying")
+```
+
+### Direct effect
+
+```{r}
+
+response <- "conflict"
+
+predictors <- c(
+  "roundTime10s",
+  "logSync",
+  "logPseudoSync",
+  "meanSmile",
+  "conflictLow",
+  "stepSize",
+  "secondRound",
+  "openingDistance"
+)
+
+if (parallelSupported) {
+  conflictDirect <- do.call(
+    rbind,
+    pbmcapply::pbmclapply(
+      X = 1:M,
+      FUN = plausibleFeolsFun,
+      response = response,
+      predictors = predictors,
+      fixedEffects = "fixedEffectsID",
+      cluster = "clusterID",
+      measurementList = congenialLinearList,
+      modelName = "Direct",
+      data = dataF2F,
+      dataLong = dataLongF2F,
+      masterSeed = masterSeed,
+      mc.cores = 15,
+      mc.set.seed = TRUE
+    )
+  )
+} else {
+  conflictDirect <- do.call(
+    rbind,
+    lapply(
+      X = 1:M,
+      FUN = plausibleFeolsFun,
+      response = response,
+      predictors = predictors,
+      fixedEffects = "fixedEffectsID",
+      cluster = "clusterID",
+      measurementList = congenialLinearList,
+      modelName = "Direct",
+      data = dataF2F,
+      dataLong = dataLongF2F,
+      masterSeed = masterSeed
+    )
+  )
+}
+
+conflictTableDirect <- plausibleProcessFun(conflictDirect)
+
+conflictTableDirect %>%
+  dplyr::select(Model, Type, Term, Estimate, SE, Z, P) %>%
+  mutate(
+    across(c(Estimate, SE, Z, P), \(x) round(x, digits = 4))
+  )
+
+conflictTableDirect <- conflictTableDirect %>%
+  dplyr::filter(Type=="Varying")
+```
+
+### Print table
+
+```{r}
+termLevels <- c(
+  "roundTime10s",
+  "logSync",
+  #  "tt(logSync)",
+  "logPseudoSync",
+  #  "tt(logPseudoSync)",
+  "meanSmile",
+  #  "tt(meanSmile)",
+  #  "smile",
+  #  "tt(smile)",
+  #  "opponentSmile",
+  #  "tt(opponentSmile)",
+  "conflictLow",
+  "stepSize",
+  "secondRound",
+  "round",
+  "openingDistance",
+  "(Intercept)",
+  "R2",
+  "N",
+  "FE",
+  "Clusters"
+)
+
+termLabels <- c(
+  "Round time (10s)",
+  "Log smile sync",
+  #  "Log smile sync × ln(1+t)",
+  "Log pseudo sync",
+  #  "Log pseudo sync × ln(1+t)",
+  "Mean smile (dyad)",
+  #  "Mean smile × ln(1+t)",
+  #  "Smile",
+  #  "Smile × ln(1+t)",
+  #  "Opponent smile",
+  #  "Opponent smile × ln(1+t)",
+  "Restricted",
+  "Step size",
+  "Second round",
+  "Round",
+  "Opening distance",
+  "Intercept",
+  "R²",
+  "N",
+  "Fixed effects",
+  "Clusters"
+)
+
+modelLevels <- c(
+  "Design", 
+  "Raw",
+  "Total",
+  "Covariates",
+  "Direct"
+)
+
+modelLabels <- c(
+  "Design", 
+  "Raw",
+  "Total",
+  "Covariates",
+  "Direct"
+)
+
+conflictTable <- dplyr::bind_rows(
+  conflictTableDesign,
+  conflictTableRaw,
+  conflictTableTotal,
+  conflictTableCovariates,
+  conflictTableDirect
+) %>%
+  group_by(Response, Model, Type, Panel, Term) %>%
+  mutate(
+    stars = case_when(
+      P <= 0.001 ~ "***",
+      P <= 0.01  ~ "**",
+      P <= 0.05  ~ "*",
+      .default = ""
+    ),
+    pFormatted = if_else(
+      P < 0.001,
+      "&lt;.001",
+      paste0("=", sub("^0", "", sprintf("%.3f", P)))
+    ),
+    Estimate = case_when(
+      Panel == "Coefficients" ~ sprintf(
+        paste0(
+          "%.3f%s",
+          "<br><span style='font-size:85%%;'>(%.3f)</span>",
+          "<br><span style='font-size:85%%;'>p%s</span>"
+        ),
+        Estimate, stars, SE, pFormatted
+      ),
+      Term == "R2" ~ sprintf("%.3f", Estimate),
+      .default = sprintf("%.0f", Estimate)
+    ),
+    Model = factor(
+      Model,
+      levels = modelLevels,
+      labels = modelLabels
+    ),
+    Panel = factor(
+      Panel,
+      levels = c("Coefficients", "Info"),
+      labels = c("Coefficients", "Model information")
+    ),
+    Term = factor(
+      Term, 
+      levels = termLevels,
+      labels = termLabels
+    )
+  )
+
+conflictTable <- conflictTable %>%
+  ungroup() %>%
+  dplyr::select(
+    Panel,
+    Term,
+    Model,
+    Estimate
+  ) %>%
+  tidyr::pivot_wider(
+    id_cols = c(Panel, Term),
+    names_from = Model,
+    values_from = Estimate
+  ) %>%
+  arrange(Panel, Term)
+
+conflictTable <- dplyr::bind_rows(
+  conflictTable %>% dplyr::filter(Panel == "Coefficients"),
+  conflictTable %>% dplyr::filter(Panel == "Model information")
+) %>%
+  dplyr::select(-Panel)
+
+conflictTableFirst <- conflictTable %>%
+  filter(
+    !(Term %in% c("Restricted", "Step size", "Second round", "Round", "Opening distance", "Intercept"))
+  )
+
+conflictTableSecond <- conflictTable %>%
+  filter(
+    !(Term %in% c("Round time (10s)", "Log smile sync", "Log pseudo sync", "Mean smile (dyad)", "Opening distance", "Intercept"))
+  )
+
+conflictGT <- conflictTable %>%
+  gt::gt(
+    rowname_col = "Term"
+  ) %>%
+  gt::tab_spanner(
+    label = "Conflict (Z)",
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::fmt_markdown(
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::cols_align(
+    align = "center",
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::sub_missing(
+    columns = tidyselect::all_of(modelLabels),
+    missing_text = "—"
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(
+      size = gt::px(12),
+      weight = "bold"
+    ),
+    locations = gt::cells_column_spanners(
+      spanners = "Conflict (Z)"
+    )
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(align = "center"),
+    locations = gt::cells_stubhead()
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_borders(
+      sides = "top",
+      color = "#D3D3D3",
+      weight = gt::px(2)
+    ),
+    locations = list(
+      gt::cells_stub(
+        rows = Term == "R²"
+      ),
+      gt::cells_body(
+        rows = Term == "R²"
+      )
+    )
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(align = "center"),
+    locations = gt::cells_stub(
+      rows = everything()
+    )
+  ) %>%
+  gt::tab_options(
+    table.font.names = c("Verdana", "Arial", "sans-serif"),
+    table.font.size = gt::px(11),
+    column_labels.font.weight = "bold",
+    column_labels.border.top.width = gt::px(0),
+    column_labels.border.bottom.width = gt::px(1),
+    table_body.hlines.width = gt::px(0),
+    table.width = gt::px(624)
+  )
+
+conflictGT <- conflictGT %>%
+  gt::tab_options(
+    table.width = gt::px(624)
+  )
+
+gt::gtsave(
+  conflictGT,
+  filename = "../Tables/conflictTable.png",
+  zoom = 3.125,
+  expand = 0
+)
+
+conflictGT
+
+conflictFirstGT <- conflictTableFirst %>%
+  gt::gt(
+    rowname_col = "Term"
+  ) %>%
+  gt::tab_spanner(
+    label = "Conflict (Z)",
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::fmt_markdown(
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::cols_align(
+    align = "center",
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::sub_missing(
+    columns = tidyselect::all_of(modelLabels),
+    missing_text = "—"
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(
+      size = gt::px(12),
+      weight = "bold"
+    ),
+    locations = gt::cells_column_spanners(
+      spanners = "Conflict (Z)"
+    )
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(align = "center"),
+    locations = gt::cells_stubhead()
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_borders(
+      sides = "top",
+      color = "#D3D3D3",
+      weight = gt::px(2)
+    ),
+    locations = list(
+      gt::cells_stub(
+        rows = Term == "R²"
+      ),
+      gt::cells_body(
+        rows = Term == "R²"
+      )
+    )
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(align = "center"),
+    locations = gt::cells_stub(
+      rows = everything()
+    )
+  ) %>%
+  gt::tab_options(
+    table.font.names = c("Verdana", "Arial", "sans-serif"),
+    table.font.size = gt::px(11),
+    column_labels.font.weight = "bold",
+    column_labels.border.top.width = gt::px(0),
+    column_labels.border.bottom.width = gt::px(1),
+    table_body.hlines.width = gt::px(0),
+    table.width = gt::px(624)
+  )
+
+conflictFirstGT <- conflictFirstGT %>%
+  gt::tab_options(
+    table.width = gt::px(624)
+  )
+
+gt::gtsave(
+  conflictFirstGT,
+  filename = "../Tables/conflictSync.png",
+  zoom = 3.125,
+  expand = 0
+)
+
+conflictSecondGT <- conflictTableSecond %>%
+  gt::gt(
+    rowname_col = "Term"
+  ) %>%
+  gt::tab_spanner(
+    label = "Conflict (Z)",
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::fmt_markdown(
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::cols_align(
+    align = "center",
+    columns = tidyselect::all_of(modelLabels)
+  ) %>%
+  gt::sub_missing(
+    columns = tidyselect::all_of(modelLabels),
+    missing_text = "—"
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(
+      size = gt::px(12),
+      weight = "bold"
+    ),
+    locations = gt::cells_column_spanners(
+      spanners = "Conflict (Z)"
+    )
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(align = "center"),
+    locations = gt::cells_stubhead()
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_borders(
+      sides = "top",
+      color = "#D3D3D3",
+      weight = gt::px(2)
+    ),
+    locations = list(
+      gt::cells_stub(
+        rows = Term == "R²"
+      ),
+      gt::cells_body(
+        rows = Term == "R²"
+      )
+    )
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(align = "center"),
+    locations = gt::cells_stub(
+      rows = everything()
+    )
+  ) %>%
+  gt::tab_options(
+    table.font.names = c("Verdana", "Arial", "sans-serif"),
+    table.font.size = gt::px(11),
+    column_labels.font.weight = "bold",
+    column_labels.border.top.width = gt::px(0),
+    column_labels.border.bottom.width = gt::px(1),
+    table_body.hlines.width = gt::px(0),
+    table.width = gt::px(624)
+  )
+
+conflictSecondGT <- conflictSecondGT %>%
+  gt::tab_options(
+    table.width = gt::px(624)
+  )
+
+gt::gtsave(
+  conflictSecondGT,
+  filename = "../Tables/conflictDesign.png",
+  zoom = 3.125,
+  expand = 0
+)
+```
+
+### Plot result
+
+```{r}
+
+
+```
+
+## Test identification
+
+```{r}
+
+idVariables <- c(
+  "fixedEffectsID",
+  "clusterID"
+)
+
+analysisVariables <- c(
+#  "conflict",
+  "SIS_C1",
+  "SIS_C2",
+  "logTime",
+  "roundTime",
+  "roundTime10s",
+  "conflictLow",
+  "stepSize",
+  "secondRound"
+)
+
+modelVariables <- c(analysisVariables, idVariables)
+
+demeanedData <- dataF2F %>%
+  dplyr::filter(
+    if_all(all_of(modelVariables), ~ !is.na(.x))
+  ) %>%
+  group_by(fixedEffectsID) %>%
+  dplyr::filter(n() == 2) %>%
+  mutate(
+    across(
+      all_of(analysisVariables) & where(is.numeric),
+      ~ as.numeric(scale(.x, center = TRUE, scale = FALSE))
+    )
+  ) %>%
+  ungroup()
+```
+
+### SUR system
+
+```{r}
+
+modelName <- "SUR"
+
+modelSUR <- '
+  
+  conflict ~ 0*1 + stepSize + secondRound
+  
+  roundTime10s ~ 0*1 + stepSize + secondRound
+  
+  conflict ~~ roundTime10s
+
+'
+
+if (parallelSupported) {
+  jointSUR <- do.call(
+    rbind,
+    pbmcapply::pbmclapply(
+      X = 1:M,
+      FUN = plausibleFunSEM,
+      model = modelSUR,
+      measurementList = congenialLinearList,
+      demean=TRUE,
+      idVariables = idVariables,
+      analysisVariables = analysisVariables,
+      data = dataF2F,
+      masterSeed = masterSeed,
+      mc.cores = 15,
+      mc.set.seed = TRUE
+    )
+  )
+} else {
+  jointSUR <- do.call(
+    rbind,
+    lapply(
+      X = 1:M,
+      FUN = plausibleFunSEM,
+      model = modelSUR,
+      measurementList = congenialLinearList,
+      demean=TRUE,
+      idVariables = idVariables,
+      analysisVariables = analysisVariables,
+      data = dataF2F,
+      masterSeed = masterSeed
+    )
+  )
+}
+
+jointTableSUR <- processFunSEM(jointSUR) %>%
+  mutate(model=modelName)
+
+jointTableSUR %>%
+  dplyr::select(lhs, op, rhs, Estimate, SE, Z, P) %>%
+  dplyr::filter(!(op=="~1")) %>%
+  mutate(
+    across(c(Estimate, SE, Z, P), \(x) round(x, digits = 4))
+  )
+```
+
+### Equation-by-Equation
+
+```{r}
+
+modelName <- "Univariate"
+
+modelConflict <- '
+  
+  conflict ~ 0*1 + roundTime10s + stepSize + secondRound
+  
+'
+
+if (parallelSupported) {
+  jointConflict <- do.call(
+    rbind,
+    pbmcapply::pbmclapply(
+      X = 1:M,
+      FUN = plausibleFunSEM,
+      model = modelConflict,
+      measurementList = congenialLinearList,
+      demean=TRUE,
+      idVariables = idVariables,
+      analysisVariables = analysisVariables,
+      data = dataF2F,
+      masterSeed = masterSeed,
+      mc.cores = 15,
+      mc.set.seed = TRUE
+    )
+  )
+} else {
+  jointConflict <- do.call(
+    rbind,
+    lapply(
+      X = 1:M,
+      FUN = plausibleFunSEM,
+      model = modelConflict,
+      measurementList = congenialLinearList,
+      demean=TRUE,
+      idVariables = idVariables,
+      analysisVariables = analysisVariables,
+      data = dataF2F,
+      masterSeed = masterSeed
+    )
+  )
+}
+
+jointTableConflict <- processFunSEM(jointConflict) %>%
+  mutate(model=modelName)
+
+jointTableConflict %>%
+  dplyr::select(lhs, op, rhs, Estimate, SE, Z, P) %>%
+  dplyr::filter(!(op=="~1")) %>%
+  mutate(
+    across(c(Estimate, SE, Z, P), \(x) round(x, digits = 4))
+  )
+
+
+modelTime <- '
+  
+  roundTime10s ~ 0*1 + conflict + stepSize + secondRound
+  
+'
+
+if (parallelSupported) {
+  jointTime <- do.call(
+    rbind,
+    pbmcapply::pbmclapply(
+      X = 1:M,
+      FUN = plausibleFunSEM,
+      model = modelTime,
+      measurementList = congenialLinearList,
+      demean=TRUE,
+      idVariables = idVariables,
+      analysisVariables = analysisVariables,
+      data = dataF2F,
+      masterSeed = masterSeed,
+      mc.cores = 15,
+      mc.set.seed = TRUE
+    )
+  )
+} else {
+  jointTime <- do.call(
+    rbind,
+    lapply(
+      X = 1:M,
+      FUN = plausibleFunSEM,
+      model = modelTime,
+      measurementList = congenialLinearList,
+      demean=TRUE,
+      idVariables = idVariables,
+      analysisVariables = analysisVariables,
+      data = dataF2F,
+      masterSeed = masterSeed
+    )
+  )
+}
+
+jointTableTime <- processFunSEM(jointTime) %>%
+  mutate(model=modelName)
+
+jointTableTime %>%
+  dplyr::select(lhs, op, rhs, Estimate, SE, Z, P) %>%
+  dplyr::filter(!(op=="~1")) %>%
+  mutate(
+    across(c(Estimate, SE, Z, P), \(x) round(x, digits = 4))
+  )
+
+jointTableUnivariate <- dplyr::bind_rows(jointTableConflict, jointTableTime)
+```
+
+### Triangular system
+
+```{r}
+
+modelName <- "Triangular"
+
+modelTriangular <- '
+  
+  conflict ~ 0*1 + roundTime10s + stepSize
+  
+  roundTime10s ~ 0*1 + stepSize + secondRound
+  
+  conflict ~~ roundTime10s
+
+'
+
+if (parallelSupported) {
+  jointTriangular <- do.call(
+    rbind,
+    pbmcapply::pbmclapply(
+      X = 1:M,
+      FUN = plausibleFunSEM,
+      model = modelTriangular,
+      measurementList = congenialLinearList,
+      demean=TRUE,
+      idVariables = idVariables,
+      analysisVariables = analysisVariables,
+      data = dataF2F,
+      masterSeed = masterSeed,
+      mc.cores = 15,
+      mc.set.seed = TRUE
+    )
+  )
+} else {
+  jointTriangular <- do.call(
+    rbind,
+    lapply(
+      X = 1:M,
+      FUN = plausibleFunSEM,
+      model = modelTriangular,
+      measurementList = congenialLinearList,
+      demean=TRUE,
+      idVariables = idVariables,
+      analysisVariables = analysisVariables,
+      data = dataF2F,
+      masterSeed = masterSeed
+    )
+  )
+}
+
+jointTableTriangular <- processFunSEM(jointTriangular) %>%
+  mutate(model=modelName)
+
+jointTableTriangular %>%
+  dplyr::select(lhs, op, rhs, Estimate, SE, Z, P) %>%
+  dplyr::filter(!(op=="~1")) %>%
+  mutate(
+    across(c(Estimate, SE, Z, P), \(x) round(x, digits = 4))
+  )
+```
+
+### Simultaneous system
+
+```{r}
+
+modelName <- "Simultaneous"
+
+modelSimultaneous <- '
+  
+  conflict ~ 0*1 + roundTime10s + stepSize
+  
+  roundTime10s ~ 0*1 + conflict + secondRound
+  
+  conflict ~~ roundTime10s
+
+'
+
+if (parallelSupported) {
+  jointSimultaneous <- do.call(
+    rbind,
+    pbmcapply::pbmclapply(
+      X = 1:M,
+      FUN = plausibleFunSEM,
+      model = modelSimultaneous,
+      measurementList = congenialLinearList,
+      demean=TRUE,
+      idVariables = idVariables,
+      analysisVariables = analysisVariables,
+      data = dataF2F,
+      masterSeed = masterSeed,
+      mc.cores = 15,
+      mc.set.seed = TRUE
+    )
+  )
+} else {
+  jointSimultaneous <- do.call(
+    rbind,
+    lapply(
+      X = 1:M,
+      FUN = plausibleFunSEM,
+      model = modelSimultaneous,
+      measurementList = congenialLinearList,
+      demean=TRUE,
+      idVariables = idVariables,
+      analysisVariables = analysisVariables,
+      data = dataF2F,
+      masterSeed = masterSeed
+    )
+  )
+}
+
+jointTableSimultaneous <- processFunSEM(jointSimultaneous) %>%
+  mutate(model=modelName)
+
+jointTableSimultaneous %>%
+  dplyr::select(lhs, op, rhs, Estimate, SE, Z, P) %>%
+  dplyr::filter(!(op=="~1")) %>%
+  mutate(
+    across(c(Estimate, SE, Z, P), \(x) round(x, digits = 4))
+  )
+```
+
+### 2SLS diagnostics
+
+```{r}
+
+extract2SLS <- function(fit, responseName, modelName = "MIIV-2SLS") {
+  
+  estimates <- tidy(fit) %>%
+    rename(
+      rhs = term,
+      Estimate = estimate,
+      SE = std.error,
+      Z = statistic,
+      P = p.value
+    ) %>%
+    mutate(
+      lhs = responseName,
+      op = "~",
+      model = modelName,
+      rhs = gsub("`", "", rhs)
+    ) %>%
+    select(lhs, op, rhs, Estimate, SE, Z, P, model)
+  
+  r2 <- fit$r.squared
+  nobs <- fit$nobs
+  nFE <- nobs / 2
+  nClusters <- fit$n_clusters
+  
+  gofRows <- tibble::tibble(
+    lhs = responseName,
+    op = "gof",
+    rhs = c("R2", "N", "FE", "Clusters"),
+    Estimate = c(
+      as.numeric(r2),
+      as.numeric(nobs),
+      as.numeric(nFE),
+      as.numeric(nClusters)
+    ),
+    SE = NA_real_,
+    Z = NA_real_,
+    P = NA_real_,
+    model = modelName
+  )
+  
+  estimates <- dplyr::bind_rows(
+    estimates,
+    gofRows,
+  )
+  
+  return(estimates)
+}
+
+extractDiagnostics <- function(fit, responseName) {
+  
+  instrumentLevels <- c(
+    "stepSize",
+    "secondRound"
+  )
+  
+  instrumentLabels <- c(
+    "Step size",
+    "Second round"
+  )
+  
+  testLevels <- c(
+    "weak_id_robust",
+    "anderson_rubin_f",
+    "endogeneity"
+  )
+  
+  testLabels <- c(
+    "Kleibergen-Paap",
+    "Anderson-Rubin",
+    "Endogeneity C-test"
+  )
+  
+  diagnosticsTable <- diagnostics(fit) %>%
+    filter(
+      test %in% c("weak_id_robust", "anderson_rubin_f", "endogeneity")
+    ) %>%
+    mutate(
+      test = factor(test, levels = testLevels, labels = testLabels),
+      pFormatted = if_else(
+        p_value < 0.001,
+        "&lt;.001",
+        paste0("=", sub("^0", "", sprintf("%.3f", p_value)))
+      ),
+      Estimate = case_when(
+        !is.na(df) & !is.na(df2) ~ sprintf(
+          "F(%.0f, %.0f)=%.3f<br>p%s",
+          df, df2, statistic, pFormatted
+        ),
+        !is.na(df) ~ sprintf(
+          "&chi;&sup2;(%.0f)=%.3f<br>p%s",
+          df, statistic, pFormatted
+        ),
+        .default = sprintf("%.0f", statistic)
+      ),
+      .keep = "none"
+    ) %>%
+    select(-pFormatted) %>%
+    pivot_wider(
+      names_from = test,
+      values_from = Estimate
+    )
+
+  out <- cbind(
+    tibble(
+      Outcome = responseName,
+      Instrument = fit$instruments,
+      `Partial-R²` = sprintf("%.3f", fit$first_stage[[fit$endogenous]]$partial_r2)
+    ),
+    diagnosticsTable
+  ) %>%
+    mutate(
+      Instrument = factor(Instrument, levels = instrumentLevels, labels = instrumentLabels)
+    )
+  
+  return(out)
+}
+```
+
+```{r}
+
+conflict2SLS <- ivreg2(
+  SIS_C1 ~ 0 + stepSize | roundTime10s | secondRound,
+  data = demeanedData,
+  method = "2sls",
+  clusters = ~clusterID,
+  small = TRUE,
+  dofminus = n_distinct(demeanedData$fixedEffectsID),
+  endog = "roundTime10s",
+  first_stage = TRUE
+)
+
+summary(conflict2SLS)
+
+time2SLS <- ivreg2(
+  roundTime10s ~ 0 + secondRound | SIS_C1 | stepSize,
+  data = demeanedData,
+  method = "2sls",
+  clusters = ~clusterID,
+  small = TRUE,
+  dofminus = n_distinct(demeanedData$fixedEffectsID),
+  endog = "SIS_C1",
+  first_stage = TRUE
+)
+
+summary(time2SLS)
+
+
+# 1. Extract structural coefficients
+jointTableConflict2SLS <- extract2SLS(conflict2SLS, responseName = "conflict")
+jointTableTime2SLS <- extract2SLS(time2SLS, responseName = "roundTime10s")
+
+jointTable2SLS <- dplyr::bind_rows(jointTableConflict2SLS, jointTableTime2SLS)
+
+
+# 2. Extract diagnostics
+diagnosticsConflict2SLS <- extractDiagnostics(conflict2SLS, responseName = "Conflict &larr; Time")
+diagnosticsTime2SLS <- extractDiagnostics(time2SLS, responseName = "Time &larr; Conflict")
+
+diagnostics2SLS <- dplyr::bind_rows(diagnosticsConflict2SLS, diagnosticsTime2SLS)
+```
+
+### Print table
+
+```{r}
+
+outcomeLevels <- c(
+  "conflict",
+  "roundTime10s"
+)
+
+outcomeLabels <- c(
+  "Conflict",
+  "Time"
+)
+
+termLevels <- c(
+  "conflict",
+  "roundTime10s",
+  "stepSize",
+  "secondRound",
+  "residual",
+  "R2",
+  "N",
+  "FE",
+  "Clusters"
+)
+
+termLabels <- c(
+  "Conflict",
+  "Time",
+  "Step size",
+  "Second round",
+  "Residual cov.",
+  "R²",
+  "N",
+  "Fixed effects",
+  "Clusters"
+)
+
+modelLevels <- c("SUR", "Univariate", "Triangular", "Simultaneous", "MIIV-2SLS")
+modelLabels <- c("SUR", "Univariate", "Triangular", "Simultaneous", "MIIV-2SLS")
+
+identificationTable <- dplyr::bind_rows(
+  jointTableSUR,
+  jointTableUnivariate,
+  jointTableTriangular,
+  jointTableSimultaneous,
+  jointTable2SLS
+) %>%
+  filter(
+    op %in% c("~", "gof")
+    | (lhs != rhs & lhs %in% outcomeLevels & rhs %in% outcomeLevels)
+  )
+
+residualRows <- identificationTable %>%
+  filter(op == "~~") %>%
+  mutate(
+    temp = lhs,
+    lhs = rhs,
+    rhs = temp
+  ) %>%
+  select(-temp)
+  
+identificationTable <- dplyr::bind_rows(identificationTable, residualRows) %>%
+  mutate(
+    rhs = ifelse(op == "~~", "residual", rhs),
+    rhs = ifelse(rhs == "SIS_C1", "conflict", rhs)
+  ) %>%
+  mutate(
+    stars = case_when(
+      P <= 0.001 ~ "***",
+      P <= 0.01  ~ "**",
+      P <= 0.05  ~ "*",
+      .default = ""
+    ),
+    pFormatted = if_else(
+      P < 0.001,
+      "&lt;.001",
+      paste0("=", sub("^0", "", sprintf("%.3f", P)))
+    ),
+    Estimate = case_when(
+      op %in% c("~", "~~") ~ sprintf(
+        "%.3f%s<br>(%.3f)<br>p%s",
+        Estimate, stars, SE, pFormatted
+      ),
+      rhs == "R2" ~ sprintf("%.3f", Estimate),
+      .default = sprintf("%.0f", Estimate)
+    ),
+    Outcome = factor(
+      lhs,
+      levels = outcomeLevels,
+      labels = outcomeLabels
+    ),
+    Model = factor(
+      model,
+      levels = modelLevels,
+      labels = modelLabels
+    ),
+    Panel = factor(
+      case_when(
+        op %in% c("~", "~~") ~ "Coefficients",
+        op == "gof" ~ "Model information",
+        .default = ""
+      ),
+      levels = c("Coefficients", "Model information")
+    ),
+    Term = factor(
+      rhs, 
+      levels = termLevels,
+      labels = termLabels
+    )
+  ) %>%
+  dplyr::select(
+    Outcome,
+    Term,
+    Model,
+    Estimate,
+    Panel
+  )
+
+identificationTable <- identificationTable %>%
+  tidyr::pivot_wider(
+    id_cols = Term,
+    names_from = c(Model, Outcome),
+    values_from = Estimate,
+    names_sep = "_",
+    names_expand = FALSE
+  ) %>%
+  arrange(Term)
+
+identificationGT <- identificationTable %>%
+  gt::gt(
+    rowname_col = "Term"
+  ) %>%
+  gt::tab_spanner_delim(
+    delim = "_"
+  ) %>%
+  gt::fmt_markdown(
+    columns = everything()
+  ) %>%
+  gt::cols_align(
+    align = "center",
+    columns = everything()
+  ) %>%
+  gt::sub_missing(
+    columns = everything(),
+    missing_text = "—"
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(
+      size = gt::px(12),
+      weight = "bold"
+    ),
+    locations = gt::cells_column_spanners()
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(align = "center"),
+    locations = gt::cells_stubhead()
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_borders(
+      sides = "top",
+      color = "#D3D3D3",
+      weight = gt::px(2)
+    ),
+    locations = list(
+      gt::cells_stub(
+        rows = Term == "R²"
+      ),
+      gt::cells_body(
+        rows = Term == "R²"
+      )
+    )
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(align = "center"),
+    locations = gt::cells_stub(
+      rows = everything()
+    )
+  ) %>%
+  gt::tab_options(
+    table.font.names = c("Verdana", "Arial", "sans-serif"),
+    table.font.size = gt::px(11),
+    column_labels.font.weight = "bold",
+    column_labels.border.top.width = gt::px(0),
+    column_labels.border.bottom.width = gt::px(1),
+    table_body.hlines.width = gt::px(0),
+    table.width = gt::px(850)
+  )
+
+if(export) {
+  gt::gtsave(
+    identificationGT,
+    filename = "../Tables/identificationTable.png",
+    zoom = 3.125,
+    expand = 0
+  ) 
+}
+
+identificationGT
+```
+
+```{r}
+
+# Build the independent gt object
+diagnosticsGT <- diagnostics2SLS %>%
+  gt::gt(
+    rowname_col = "Outcome"
+  ) %>%
+  gt::fmt_markdown(
+    columns = everything()
+  ) %>%
+  gt::cols_align(
+    align = "center",
+    columns = everything()
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(
+      align = "center",
+      weight = "bold"
+    ),
+    locations = gt::cells_stub(rows = everything())
+  ) %>%
+  gt::tab_style(
+    style = gt::cell_text(align = "center"),
+    locations = gt::cells_stubhead()
+  ) %>%
+  # Apply the exact same visual footprint
+  gt::tab_options(
+    table.font.names = c("Verdana", "Arial", "sans-serif"),
+    table.font.size = gt::px(11),
+    column_labels.font.weight = "bold",
+    column_labels.border.top.width = gt::px(0),
+    column_labels.border.bottom.width = gt::px(1),
+    table_body.hlines.width = gt::px(0),
+    table.width = gt::px(850) # Forces the exact same pixel width
+  )
+
+if(export) {
+  gt::gtsave(
+    diagnosticsGT,
+    filename = "../Tables/identificationDiagnostics.png",
+    zoom = 3.125,
+    expand = 0
+  )
+}
+
+diagnosticsGT
+```

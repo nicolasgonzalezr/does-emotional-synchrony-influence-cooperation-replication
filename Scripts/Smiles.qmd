@@ -1,0 +1,512 @@
+---
+title: "Smile Plot"
+format: html
+editor: visual
+---
+
+## Load libraries
+
+```{r}
+
+library(tidyverse)
+library(pbmcapply)
+```
+
+## Load data
+
+```{r}
+
+dataF2F <- readRDS("../Datasets/dataF2F.rds") %>%
+  mutate(
+    dyadID = interaction(session, round, group, drop = TRUE)
+  ) %>%
+  left_join(
+    readRDS("../Datasets/dataClockOffsets.rds"),
+    by=join_by(session, player, round)
+  )
+```
+
+## Define label mapping
+
+```{r}
+
+emotions7 <- c("Neutral", "Happy", "Sad", "Surprise", "Fear", "Disgust", "Anger")
+emotions8 <- c("Neutral", "Happy", "Sad", "Surprise", "Fear", "Disgust", "Anger", "Contempt")
+
+BP4D <- c("AU1", "AU2", "AU4", "AU6", "AU7", "AU10", "AU12", "AU14", "AU15", "AU17", "AU23", "AU24")
+
+DISFA <- c("AU1", "AU2", "AU4", "AU6", "AU9", "AU12", "AU25", "AU26")
+
+hybrid <- c('AU1', 'AU2', 'AU4', 'AU5', 'AU6', 'AU7', 'AU9', 'AU10', 'AU11', 'AU12', 'AU13', 'AU14', 'AU15', 'AU16', 'AU17', 'AU18', 'AU19', 'AU20', 'AU22', 'AU23', 'AU24', 'AU25', 'AU26', 'AU27', 'AU32', 'AU38', 'AU39', 'AUL1', 'AUR1', 'AUL2', 'AUR2', 'AUL4', 'AUR4', 'AUL6', 'AUR6', 'AUL10', 'AUR10', 'AUL12', 'AUR12', 'AUL14', 'AUR14')
+
+
+modelMap <- list(
+  FERAU = "Happy",
+  DDAMFN_Aff7 = emotions7,
+  DDAMFN_Aff8 = emotions8,
+  DDAMFN_RAF = emotions7,
+  MEGraphAU_BP4D_FLD1 = BP4D,
+  MEGraphAU_DISFA_FLD1 = DISFA,
+  OpenGraphAU = hybrid,
+  OpenFace_Emotions = emotions8,
+  OpenFace_AU = DISFA
+)
+```
+
+## Define helpers
+
+### File loading
+
+```{r}
+
+basePath <- "../Processed"
+
+fileList <- list.files(basePath, pattern = "^Nico.*\\.rds$")
+
+loadFile <- function(fileList, session, player, roundNum, model="DDAMFN_Aff7") {
+  
+  padded <- ifelse(roundNum < 10, paste0("0", roundNum), roundNum)
+  
+  pattern <- paste0("S", session, "_", player, "_R", padded)
+  
+  fileName <- grep(pattern, fileList, value = TRUE)
+  
+  if (length(fileName) == 0) {
+    cat(
+      "Error, no file for ", pattern, "\n\n"
+    )
+    return(NA)
+  }
+  
+  file <- readRDS(file.path(basePath, fileName))
+  
+  df <- as.data.frame(file[[model]])
+  
+  names(df) <- modelMap[[model]]
+  
+  timestamps <- file[["timestamps"]]
+  
+  timestampsLngth <- length(timestamps)
+  
+  dfLgth <- nrow(df)
+  
+  if (timestampsLngth != dfLgth) {
+    cat(
+      "Error in file ", fileName, "\n\n",
+      "Timestamps length: ", timestampsLngth, "\n\n",
+      "Inference length: ", dfLgth, "\n\n"
+    )
+    df$timestamps <- NA
+  } else {
+    if (session <= 21) {
+      df$timestamps <- timestamps - 7
+    } else {
+      df$timestamps <- timestamps
+    }
+  }
+  
+  cat(
+    fileName, "\n\n",
+    "Session match: ", file[["session"]] == session,
+    ", Player match: ", file[["player"]] == player,
+    ", Round match: ", file[["round"]] == roundNum, 
+    "\n\n"
+  )
+  
+  return(df)
+}
+```
+
+### Series smoothing
+
+```{r}
+
+funEMA <- function(signal, ts, tau) {
+  
+  EMA <- numeric(length(signal))
+  EMA[1] <- signal[1]
+  
+  for (i in 2:length(signal)) {
+    dt <- ts[i] - ts[i - 1]
+    alpha <- 1 - exp(-dt / tau)
+    
+    EMA[i] <- EMA[i - 1] +
+      alpha * (signal[i] - EMA[i - 1])
+  }
+  
+  EMA
+}
+
+smoothTs <- function(df, session, player, opponent, dyadID, roundNum, roundTime, agreement, signalName, modelName, halfLife=2, riskWindow=0.25) {
+  
+  ts <- df$timestamps
+  
+  H <- halfLife # Half-life
+  tau <- H / log(2)
+  
+  seriesNorm <- unname(sqrt(rowSums((df[, signalName, drop=FALSE])^2)))
+    
+  EMA <- funEMA(seriesNorm, ts, tau)
+
+  roundStart <- 0
+  startTimes <- seq(roundStart, roundTime, by=riskWindow)
+  startTimes <- startTimes[startTimes < roundTime]
+  endTimes <- c(startTimes[-1], roundTime)
+  sampledEMA <- c()
+  
+  for (t in startTimes) {
+    
+    leftCandidates <- ts[ts <= t]
+    rightCandidates <- ts[ts > t]
+    
+    if (length(leftCandidates) == 0) {
+      
+      sampledEMA <- c(sampledEMA, NA)
+      
+    } else {
+      
+      leftLimit <- max(leftCandidates)
+      
+      if (t - leftLimit > H) {
+        
+        sampledEMA <- c(sampledEMA, NA)
+        
+      } else if (length(rightCandidates) == 0) {
+        
+        leftEMA <- EMA[match(leftLimit, ts)]
+        sampledEMA <- c(sampledEMA, leftEMA)
+        
+      } else {
+        
+        rightLimit <- min(rightCandidates)
+        
+        if (rightLimit - t > H) {
+          
+          leftEMA <- EMA[match(leftLimit, ts)]
+          sampledEMA <- c(sampledEMA, leftEMA)
+          
+        } else {
+          
+          weight <- (rightLimit - t) / (rightLimit - leftLimit)
+          
+          leftEMA <- EMA[match(leftLimit, ts)]
+          rightEMA <- EMA[match(rightLimit, ts)]
+          
+          weightedEMA <- weight * leftEMA + (1 - weight) * rightEMA
+          
+          sampledEMA <- c(sampledEMA, weightedEMA)
+        }
+      }
+    }
+  }
+  
+  result <- tibble(
+    session = session,
+    player = player,
+    opponent = opponent,
+    dyadID = dyadID,
+    round = roundNum,
+    model = modelName,
+    signal = paste(signalName, collapse="_"),
+    valueEMA = sampledEMA,
+    startTime = startTimes,
+    endTime = endTimes,
+    agreement = as.integer(
+      agreement == 1 &
+        seq_along(startTimes) == length(startTimes)
+    )
+  )
+  
+}
+```
+
+## Build smile long
+
+```{r}
+
+signalLongFun <- function(i, data, session, player, roundNum, roundTime, agreement, signalName, modelName, halfLife=2, riskWindow=0.25, startTs) {
+        
+  session     <- data[i, "session", drop = TRUE]
+  player      <- data[i, "player", drop = TRUE]
+  opponent    <- data[i, "opponent", drop = TRUE]
+  dyadID      <- data[i, "dyadID", drop = TRUE]
+  roundNum    <- data[i, "round", drop = TRUE]
+  roundTime   <- data[i, "roundTime", drop = TRUE]
+  agreement   <- data[i, "agreement", drop = TRUE]
+  clockOffset <- data[i, "medianClockOffset", drop = TRUE]
+  
+  df <- loadFile(
+    fileList,
+    session=session,
+    player=player,
+    roundNum=roundNum,
+    model=modelName
+  )
+  
+  if (!is.data.frame(df)) {
+    # file is NA
+    return(NULL)
+  }
+  
+  if (nrow(df) == 0L || all(is.na(df$timestamps))) {
+    # all NA entries
+    return(NULL)
+  }
+  
+  dyadKey <- as.character(dyadID)
+  
+  if (!dyadKey %in% names(startTs)) {
+    warning(
+      "No startTs entry for dyadID=", dyadKey,
+      "; session=", session,
+      "; player=", player,
+      "; round=", roundNum
+    )
+    return(NULL)
+  }
+  
+  startTime <- startTs[[dyadKey]]
+  
+  df <- df %>%
+    mutate(timestamps = timestamps + clockOffset) %>%
+    dplyr::filter(timestamps >= startTime)
+  
+  out <- smoothTs(
+    df,
+    session,
+    player,
+    opponent,
+    dyadID,
+    roundNum,
+    roundTime,
+    agreement,
+    signalName,
+    modelName,
+    halfLife,
+    riskWindow
+  )
+  
+  return(out) # Success
+}
+```
+
+```{r}
+
+modelName <- "FERAU"
+signalName <- c("Happy")
+halfLife <- 2
+riskWindow <- 0.25
+
+storedDTW <- readRDS("../Datasets/dtwResults.rds")
+
+startTs <- sapply(
+  storedDTW[[1]],
+  function(dyad) {
+    start <- dyad$aligned[[1]]$pathTimestamps[[1]]
+    names(start) <- dyad$dyadID
+    return(start)
+  }
+)
+
+rm(storedDTW)
+
+dataSignalLong <- pbmclapply(
+  1:nrow(dataF2F),
+  signalLongFun,
+  dataF2F, 
+  session, 
+  player, 
+  roundNum, 
+  roundTime, 
+  agreement, 
+  signalName, 
+  modelName, 
+  halfLife, 
+  riskWindow, 
+  startTs,
+  mc.cores = 4
+)
+
+dataSignalLong <- do.call(
+  rbind,
+  dataSignalLong
+)
+
+opponentDf <- dataSignalLong %>%
+  select(-opponent) %>%
+  rename(
+    opponentEMA=valueEMA
+  )
+
+by <- join_by(session, opponent==player, dyadID, round, model, signal, startTime, endTime, agreement)
+
+dataSignalLong <- left_join(dataSignalLong, opponentDf, by=by)
+
+rm(opponentDf)
+
+resultsPath <- "../Datasets/dataSignalsLong.rds"
+
+if (file.exists(resultsPath)) {
+  storedResults <- readRDS(resultsPath) %>%
+    dplyr::filter(!(model == modelName & signal == paste(signalName, collapse = "_")))
+} else {
+  storedResults <- NULL
+}
+
+storedResults <- dplyr::bind_rows(storedResults, dataSignalLong)
+
+saveRDS(storedResults, file = resultsPath)
+```
+
+## Build smile summary
+
+```{r}
+
+signalSummaryFun <- function(i, data, session, player, roundNum, roundTime, signalName, modelName, startTs, epsilon = 0.5) {
+  
+  session     <- data[i, "session", drop = TRUE]
+  player      <- data[i, "player", drop = TRUE]
+  opponent    <- data[i, "opponent", drop = TRUE]
+  dyadID      <- data[i, "dyadID", drop = TRUE]
+  roundNum    <- data[i, "round", drop = TRUE]
+  roundTime   <- data[i, "roundTime", drop = TRUE]
+  clockOffset <- data[i, "medianClockOffset", drop = TRUE]
+  
+  df <- loadFile(
+    fileList,
+    session=session,
+    player=player,
+    roundNum=roundNum,
+    model=modelName
+  )
+  
+  if (!is.data.frame(df)) {
+    # file is NA
+    return(NULL)
+  }
+  
+  if (nrow(df) == 0L || all(is.na(df$timestamps))) {
+    # all NA entries
+    return(NULL)
+  }
+  
+  dyadKey <- as.character(dyadID)
+  
+  if (!dyadKey %in% names(startTs)) {
+    warning(
+      "No startTs entry for dyadID=", dyadKey,
+      "; session=", session,
+      "; player=", player,
+      "; round=", roundNum
+    )
+    return(NULL)
+  }
+  
+  startTime <- startTs[[dyadKey]]
+  
+  df <- df %>%
+    mutate(timestamps = timestamps + clockOffset) %>%
+    dplyr::filter(startTime <= timestamps & timestamps <= roundTime + epsilon)
+  
+  signalSummary <- mean(sqrt(rowSums((df[, signalName, drop=FALSE])^2)), na.rm=TRUE)
+    
+  out <- tibble(
+    session = session,
+    player = player,
+    opponent = opponent,
+    dyadID = dyadID,
+    round = roundNum,
+    model = modelName,
+    signal = paste(signalName, collapse="_"),
+    value = signalSummary
+  )
+  
+  return(out) # Success
+}
+```
+
+```{r}
+
+modelName <- "FERAU"
+signalName <- "Happy"
+
+storedDTW <- readRDS("../Datasets/dtwResults.rds")
+
+startTs <- sapply(
+  storedDTW[[1]],
+  function(dyad) {
+    start <- dyad$aligned[[1]]$pathTimestamps[[1]]
+    names(start) <- dyad$dyadID
+    return(start)
+  }
+)
+
+rm(storedDTW)
+
+dataSignalSummary <- pbmclapply(
+  1:nrow(dataF2F),
+  signalSummaryFun,
+  dataF2F, 
+  session, 
+  player, 
+  roundNum, 
+  roundTime, 
+  signalName, 
+  modelName, 
+  startTs,
+  epsilon=0.5,
+  mc.cores = 4
+)
+
+dataSignalSummary <- do.call(
+  rbind,
+  dataSignalSummary
+)
+
+opponentDf <- dataSignalSummary %>%
+  select(-opponent) %>%
+  rename(
+    opponentValue=value
+  )
+
+by <- join_by(session, opponent==player, dyadID, round, model, signal)
+
+dataSignalSummary <- left_join(dataSignalSummary, opponentDf, by=by)
+
+rm(opponentDf)
+
+
+resultsPath <- "../Datasets/dataSignals.rds"
+
+if (file.exists(resultsPath)) {
+  storedResults <- readRDS(resultsPath) %>%
+    dplyr::filter(!(model == modelName & signal == paste(signalName, collapse = "_")))
+} else {
+  storedResults <- NULL
+}
+
+storedResults <- dplyr::bind_rows(storedResults, dataSignalSummary)
+
+saveRDS(storedResults, file = resultsPath)
+```
+
+```{r}
+
+ggplot(data = smilePlotDf, aes(x=timeToAgreement, y=anger))+
+  geom_jitter(color="steelblue", alpha=0.05)+
+  geom_smooth(color="steelblue", fill="steelblue", linewidth=1.5) +
+  coord_cartesian(xlim = c(-3, 70)) +
+  scale_x_reverse() +
+  theme_minimal()
+
+ggplot(data = smilePlotDf, aes(x=time, y=anger))+
+  geom_jitter(color="lightcoral", alpha=0.05)+
+  geom_smooth(color="lightcoral", fill="lightcoral", linewidth=1.5) +
+  coord_cartesian(xlim = c(-10, 60)) +
+  labs(
+    title = "Smiling trajectory",
+    x = "Round time",
+    y = "Smiling"
+  ) +
+  theme_minimal()
+```

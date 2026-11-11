@@ -1,0 +1,1206 @@
+---
+title: "AnalysisAvatar"
+format: html
+editor: visual
+---
+
+# Avatar bargaining analysis
+
+## Load libraries
+
+```{r}
+
+set.seed(72529)
+
+library(tidyverse)
+library(broom)
+library(fixest)        # Fixed effects regression
+library(survival)      # Cox regression
+library(coxme)         # Cox regression with random effects
+library(lavaan)        # SEM
+library(modelsummary)
+library(tinytable)
+library(pbmcapply)     # Parallel
+library(mnormt)        # Multivariate normal draw
+library(ivreg2r)       # robust GMM/2SLS
+```
+
+```{r}
+
+RNGkind("L'Ecuyer-CMRG")
+masterSeed <- 779
+
+parallelSupported <- TRUE
+availableCores <- 15
+M <- 100   # Multiple imputation draws
+```
+
+## Load data
+
+```{r}
+
+dataAvatarLong <- readRDS("../Datasets/dataAvatarLong.rds") %>%
+  mutate(
+    avatarDemand = avatarDemand / 1000,
+    playerID = paste0(session, player, round)
+  )
+
+dataAvatarLong <- dataAvatarLong %>%
+  left_join(
+    readRDS(file = "../Datasets/dataAvatarLongSmiles.rds"),
+    by = c("session", "player", "round", "startTime", "endTime", "agreement")
+  ) %>%
+  left_join(
+    readRDS(file = "../Datasets/dataAvatarLongDTW.rds"),
+    by = c("playerID", "startTime", "endTime", "agreement")
+  ) %>%
+  left_join(
+    readRDS(file = "../Datasets/dataAvatarSmiles.rds"),
+    by = c("session", "player", "round")
+  ) %>%
+  mutate(
+    roundTime10s = roundTime/10,
+    avatarSmilePre  = avatarSmilePre * 10,
+    avatarSmilePost = avatarSmilePost * 10,
+    playerSmilePre  = playerSmilePre * 10,
+    playerSmilePost = playerSmilePost * 10,
+    across(
+      starts_with("shape") | starts_with("deriv"),
+      \(x) as.numeric(-scale(x)),
+      .names = "sync{paste0(toupper(substr(.col, 1, 1)), substring(.col, 2))}"
+    ),
+    across(
+      starts_with("shape") | starts_with("deriv"),
+      \(x) -log(x),
+      .names = "logSync{paste0(toupper(substr(.col, 1, 1)), substring(.col, 2))}"
+    )
+  ) %>%
+  left_join(
+    readRDS(file = "../Datasets/dataAvatarDTW.rds") %>%
+      mutate(
+        across(
+          starts_with("shape") | starts_with("deriv"),
+          \(x) as.numeric(-scale(x)),
+          .names = "sync{paste0(toupper(substr(.col, 1, 1)), substring(.col, 2))}"
+        ),
+        across(
+          starts_with("shape") | starts_with("deriv"),
+          \(x) -log(x),
+          .names = "logSync{paste0(toupper(substr(.col, 1, 1)), substring(.col, 2))}"
+        )
+      )
+    , by = c("playerID")
+  ) %>%
+  group_by(clusterID) %>%
+  mutate(
+    stratumEventTime = ifelse(
+      max(agreement)==1, # At least one round of the match ended in agreement
+      min(roundTime),    # Time of the first event in the risk set (match)
+      NA
+    ),
+    eventRound = ifelse(
+      !is.na(stratumEventTime),
+      as.numeric(roundTime == stratumEventTime),
+      NA
+    )
+  ) %>%
+  ungroup()
+
+dataAvatar <- dataAvatarLong %>%
+  group_by(clusterID) %>%
+  dplyr::filter(
+    startTime < stratumEventTime & stratumEventTime <= endTime
+  ) %>%
+  ungroup()
+  
+dataSIS <- dplyr::bind_rows(
+  readRDS("../Datasets/dataAvatar.rds"),
+  readRDS("../Datasets/dataF2F.rds")
+) %>%
+  select(
+    session, player, match, round, clusterID, starts_with("SIS")
+  )
+
+dataWideSIS <- dataSIS %>%
+  pivot_wider(
+    id_cols = c(session, player),
+    names_from = round,
+    values_from = starts_with("SIS"),
+    names_glue = "R{round}_{.value}"
+  )
+
+dataConstants <- readRDS("../Datasets/dataConstants.rds")
+```
+
+## CFA
+
+### SIS
+
+#### State-trait model
+
+```{r}
+
+rounds <- 3:10
+
+mappingSIS <- list(
+  MD = c("SIS_MD1", "SIS_MD2"),
+  C  = c("SIS_C1", "SIS_C2"),
+  IC = c("SIS_IC1", "SIS_IC2"),
+  P  = c("SIS_P1", "SIS_P2"),
+  FD = c("SIS_FD1", "SIS_FD2")
+)
+
+stateSyntax <- paste(
+  unlist(
+    lapply(
+      seq_along(mappingSIS),
+      function(i) {
+        sapply(
+          rounds, 
+          function(r){
+            lvName <- names(mappingSIS)[i]
+            paste0(
+              lvName, r, " =~ ", 
+              paste(
+                paste0(
+                  paste0(lvName, "_L", seq_along(mappingSIS[[i]]), "*"),
+                  paste0("R", r, "_", mappingSIS[[i]])
+                ),
+                collapse = " + "
+              ),
+              " \n "
+            )
+          }
+        )
+      }
+    )
+  ),
+  collapse = ""
+)
+
+traitSyntax <- paste(
+  sapply(
+    seq_along(mappingSIS),
+    function(i) {
+      paste0(
+        names(mappingSIS)[i], "_T =~ ",
+        paste(
+          paste0("1*", names(mappingSIS)[i], rounds),
+          collapse = " + "
+        ),
+        " \n "
+      )
+    }
+  ),
+  collapse = ""
+)
+
+varianceSyntax <- paste(
+  unlist(
+    lapply(
+      seq_along(mappingSIS),
+      function(i) {
+        lvName <- names(mappingSIS)[i]
+        stateVars <- sapply(
+          rounds,
+          function(r) {
+            paste0(
+              lvName, r, " ~~ ", lvName, "_V", r, "*", lvName, r, " \n "
+            )
+          }
+        )
+        traitVar <- paste0(lvName, "_T ~~ ", lvName, "_T_V*", lvName, "_T", " \n ")
+#        traitVar <- paste0(lvName, "_T ~~ 1*", lvName, "_T", " \n ")
+        
+        c(stateVars, traitVar)
+      }
+    )
+  ),
+  collapse = ""
+)
+
+covarianceSyntax <- paste(
+  unlist(
+    sapply(
+      seq_along(mappingSIS),
+      function(i) {
+        sapply(
+          rounds[-length(rounds)],
+          function(r) {
+            lvName <- names(mappingSIS)[i]
+            
+            rLeft <- (r+1):max(rounds)
+            
+            paste0(lvName, r, " ~~ ", paste(paste0("0*", lvName, rLeft), collapse= " + "), " \n ")
+          }
+        )
+      }
+    )
+  ),
+  collapse = ""
+)
+
+meanSyntax <- paste(
+  unlist(
+    sapply(
+      seq_along(mappingSIS),
+      function(i) {
+        sapply(
+          rounds,
+          function(r) {
+            lvName <- names(mappingSIS)[i]
+            paste0(lvName, r, " ~ ", lvName, "_M", r, "*1" ," \n ")
+          }
+        )
+      }
+    )
+  ),
+  collapse = ""
+)
+
+interceptSyntax <- paste(
+  unlist(
+    lapply(
+      seq_along(mappingSIS),
+      function(i) {
+        lvName <- names(mappingSIS)[i]
+        unlist(
+          lapply(
+            seq_along(mappingSIS[[i]]),
+            function(j) {
+              paste0("R", rounds, "_", mappingSIS[[i]][[j]], " ~ ", lvName, j, "_I*1 \n ")
+            }
+          )
+        )
+      }
+    )
+  ),
+  collapse = ""
+)
+
+
+
+identificationConstraints <- paste(
+  sapply(
+    seq_along(mappingSIS),
+    function(i) {
+      lvName <- names(mappingSIS)[i]
+      stateMeans <- paste0(lvName, "_M", rounds)
+      stateVariances <- paste0(lvName, "_V", rounds)
+      
+      paste0(
+        # Pooled mean zero
+        paste(stateMeans, collapse = " + "),
+        " == 0 \n ",
+        
+        # Pooled variance one
+        lvName, "_T_V + (",
+        "(",
+        paste(
+          c(
+            stateVariances,
+            paste0("(", stateMeans, ")^2")
+          ),
+          collapse = " + "
+        ),
+        ") / ", length(rounds), " == 1 \n "
+      )
+    }
+  ),
+  collapse = ""
+)
+
+
+syntaxST <- paste(
+  stateSyntax,
+  traitSyntax,
+  varianceSyntax,
+  covarianceSyntax,
+  meanSyntax,
+  interceptSyntax,
+  identificationConstraints
+)
+```
+
+#### Correlated states model
+
+```{r}
+
+rounds <- 3:10
+
+mappingSIS <- list(
+#  MD = c("SIS_MD1", "SIS_MD2"),
+  C  = c("SIS_C1", "SIS_C2"),
+  IC = c("SIS_IC1", "SIS_IC2")
+#  P  = c("SIS_P1", "SIS_P2"),
+#  FD = c("SIS_FD1", "SIS_FD2")
+)
+
+stateSyntax <- paste(
+  unlist(
+    lapply(
+      seq_along(mappingSIS),
+      function(i) {
+        sapply(
+          rounds, 
+          function(r){
+            lvName <- names(mappingSIS)[i]
+            paste0(
+              lvName, r, " =~ ", 
+              paste(
+                paste0(
+                  paste0(lvName, "_L", seq_along(mappingSIS[[i]]), "*"),
+                  paste0("R", r, "_", mappingSIS[[i]])
+                ),
+                collapse = " + "
+              ),
+              " \n "
+            )
+          }
+        )
+      }
+    )
+  ),
+  collapse = ""
+)
+
+varianceSyntax <- paste(
+  unlist(
+    lapply(
+      seq_along(mappingSIS),
+      function(i) {
+        lvName <- names(mappingSIS)[i]
+        stateVars <- sapply(
+          rounds,
+          function(r) {
+            paste0(
+              lvName, r, " ~~ ", lvName, "_V", r, "*", lvName, r, " \n "
+            )
+          }
+        )
+      }
+    )
+  ),
+  collapse = ""
+)
+
+meanSyntax <- paste(
+  unlist(
+    sapply(
+      seq_along(mappingSIS),
+      function(i) {
+        sapply(
+          rounds,
+          function(r) {
+            lvName <- names(mappingSIS)[i]
+            paste0(lvName, r, " ~ ", lvName, "_M", r, "*1" ," \n ")
+          }
+        )
+      }
+    )
+  ),
+  collapse = ""
+)
+
+interceptSyntax <- paste(
+  unlist(
+    lapply(
+      seq_along(mappingSIS),
+      function(i) {
+        lvName <- names(mappingSIS)[i]
+        unlist(
+          lapply(
+            seq_along(mappingSIS[[i]]),
+            function(j) {
+              paste0("R", rounds, "_", mappingSIS[[i]][[j]], " ~ ", lvName, j, "_I*1 \n ")
+            }
+          )
+        )
+      }
+    )
+  ),
+  collapse = ""
+)
+
+
+
+identificationConstraints <- paste(
+  sapply(
+    seq_along(mappingSIS),
+    function(i) {
+      lvName <- names(mappingSIS)[i]
+      stateMeans <- paste0(lvName, "_M", rounds)
+      stateVariances <- paste0(lvName, "_V", rounds)
+      
+      paste0(
+        # Pooled mean zero
+        paste(stateMeans, collapse = " + "),
+        " == 0 \n ",
+        
+        # Pooled variance one
+        #        lvName, "_T_V + (",
+        "(",
+        paste(
+          c(
+            stateVariances,
+            paste0("(", stateMeans, ")^2")
+          ),
+          collapse = " + "
+        ),
+        ") / ", length(rounds), " == 1 \n "
+      )
+    }
+  ),
+  collapse = ""
+)
+
+
+syntaxS <- paste(
+  stateSyntax,
+  varianceSyntax,
+  meanSyntax,
+  interceptSyntax,
+  identificationConstraints
+)
+```
+
+```{r}
+
+stateFit <- cfa(
+  syntaxS, 
+  estimator = "MLR",
+  meanstructure = TRUE,
+  std.lv = FALSE,
+  auto.fix.first = FALSE,
+#  missing = "fiml",
+  verbose = TRUE,
+  dataWideSIS
+)
+
+summary(stateFit, standardized = TRUE, fit.measures=TRUE)
+```
+
+#### Pooled
+
+```{r}
+
+cfaModelSIS <- '
+
+  mutualDependence =~ SIS_MD1 + SIS_MD2
+
+  conflict =~ SIS_C1 + SIS_C2
+  
+  informationCertainty =~ SIS_IC1 + SIS_IC2
+  
+'
+
+pooledFitSIS <- cfa(
+  cfaModelSIS, 
+  estimator = "MLR",
+  meanstructure = TRUE,
+  std.lv = TRUE,
+  missing = "fiml",
+  cluster = "clusterID",
+  dataSIS
+)
+
+summary(pooledFitSIS, standardized = TRUE, fit.measures=TRUE)
+```
+
+```{r}
+
+cfaModelSIS <- '
+
+  mutualDependence =~ SIS_MD1 + SIS_MD2
+
+  conflict =~ SIS_C1 + SIS_C2
+  
+  informationCertainty =~ SIS_IC1 + SIS_IC2
+  
+  power =~ SIS_P1 + SIS_P2
+  
+'
+
+matchTwoFitSIS <- cfa(
+  cfaModelSIS, 
+  estimator = "MLR",
+  meanstructure = TRUE,
+  std.lv = TRUE,
+  missing = "fiml",
+  cluster = "clusterID",
+  dataSIS[dataSIS$match %in% c(2), ]
+)
+
+summary(matchTwoFitSIS, standardized = TRUE, fit.measures=TRUE)
+
+matchThreeFitSIS <- cfa(
+  cfaModelSIS, 
+  estimator = "MLR",
+  meanstructure = TRUE,
+  std.lv = TRUE,
+  missing = "fiml",
+  cluster = "clusterID",
+  dataSIS[dataSIS$match %in% c(3), ]
+)
+
+summary(matchThreeFitSIS, standardized = TRUE, fit.measures=TRUE)
+
+matchFourFitSIS <- cfa(
+  cfaModelSIS, 
+  estimator = "MLR",
+  meanstructure = TRUE,
+  std.lv = TRUE,
+  missing = "fiml",
+  cluster = "clusterID",
+  dataSIS[dataSIS$match %in% c(4), ]
+)
+
+summary(matchFourFitSIS, standardized = TRUE, fit.measures=TRUE)
+
+matchFiveFitSIS <- cfa(
+  cfaModelSIS, 
+  estimator = "MLR",
+  meanstructure = TRUE,
+  std.lv = TRUE,
+  missing = "fiml",
+  cluster = "clusterID",
+  dataSIS[dataSIS$match %in% c(5), ]
+)
+
+summary(matchFiveFitSIS, standardized = TRUE, fit.measures=TRUE)
+```
+
+#### Multigroup
+
+```{r}
+
+cfaModelSIS <- '
+
+  conflict =~ SIS_C1 + SIS_C2
+  
+  informationCertainty =~ SIS_IC1 + SIS_IC2
+  
+'
+
+multigroupFitSIS <- cfa(
+  cfaModelSIS, 
+  estimator = "MLR",
+  meanstructure = TRUE,
+  group = "round",
+  group.equal = c("loadings"),
+  std.lv = TRUE,
+#  missing = "fiml",
+#  cluster = "clusterID",
+  dataSIS[dataSIS$match %in% c(2, 3, 4, 5), ]
+)
+
+summary(multigroupFitSIS, standardized = TRUE, fit.measures=TRUE)
+
+```
+
+```{r}
+
+
+#  mutualDependence =~ SIS_MD1 + SIS_MD2
+#  power =~ SIS_P1 + SIS_P2
+#  futureDependence =~ SIS_FD1 + SIS_FD2
+
+
+cfaModelSIS <- '
+
+  mutualDependence =~ SIS_MD1 + SIS_MD2
+
+  conflict =~ SIS_C1 + SIS_C2
+  
+  informationCertainty =~ SIS_IC1 + SIS_IC2
+  
+  power =~ SIS_P1 + SIS_P2
+  
+'
+
+linearCfaFitSIS <- cfa(
+  cfaModelSIS, 
+  estimator = "MLR",
+  meanstructure = TRUE,
+  std.lv = TRUE,
+  missing = "fiml", 
+  cluster="clusterID", 
+  dataAvatar
+)
+
+summary(linearCfaFitSIS, standardized = TRUE, fit.measures=TRUE)
+
+#ordinalCfaFitSIS <- cfa(
+#  cfaModelSIS, 
+#  estimator = "WLSMV",
+#  ordered = c("SIS_MD1", "SIS_MD2", "SIS_C1", "SIS_C2", "SIS_IC1", "SIS_IC2"),
+#  parameterization = "theta",
+#  dataAvatar
+#)
+
+#summary(ordinalCfaFitSIS, standardized = TRUE)
+
+factorScoresSIS <- lavPredict(linearCfaFitSIS, method = "regression")
+
+dataFS <- cbind(dataAvatar, factorScoresSIS)
+```
+
+### MMQ
+
+```{r}
+
+reflexivity <- paste0("MMQ_", c("1", "6", "8", "10", "16", "17", "18", "31", "32"))
+
+egoStrength <- paste0("MMQ_", c("11", "22", "24", "25", "26", "30"))
+
+relationalAttunement <- paste0("MMQ_", c("4", "5", "14", "21", "28"))
+
+positiveMentalizing <- c(reflexivity, egoStrength, relationalAttunement)
+
+relationalDiscomfort <- paste0("MMQ_", c("9", "12", "15", "27", "33"))
+
+distrust <- paste0("MMQ_", c("13", "19", "20", "29"))
+
+emotionalDyscontrol <- paste0("MMQ_", c("2", "3", "7", "23"))
+
+negativeMentalizing <- c(relationalDiscomfort, distrust, emotionalDyscontrol)
+
+
+ordinalCfaModelMMQ <- paste(
+  paste("reflexivity =~", paste(reflexivity, collapse = " + ")),
+  paste("egoStrength =~", paste(egoStrength, collapse = " + ")),
+  paste("relationalAttunement =~", paste(relationalAttunement, collapse = " + ")),
+  paste("relationalDiscomfort =~", paste(relationalDiscomfort, collapse = " + ")),
+  paste("distrust =~", paste(distrust, collapse = " + ")),
+  paste("emotionalDyscontrol =~", paste(emotionalDyscontrol, collapse = " + ")),
+#  paste("positiveMentalizing =~ reflexivity + egoStrength + relationalAttunement"),
+#  paste("negativeMentalizing =~ relationalDiscomfort + distrust + emotionalDyscontrol"),
+  sep = "\n"
+)
+
+#ordinalCfaFitMMQ <- cfa(
+#  ordinalCfaModelMMQ, 
+#  estimator = "WLSMV",
+#  ordered = c(positiveMentalizing, negativeMentalizing),
+#  parameterization = "theta",
+#  dataConstants
+#)
+
+linearCfaFitMMQ <- cfa(
+  ordinalCfaModelMMQ, 
+  estimator = "MLR",
+  meanstructure = TRUE,
+  std.lv = TRUE,
+  missing = "fiml",
+  dataConstants
+)
+
+#summary(linearCfaFitMMQ, standardized = TRUE, fit.measures = TRUE)
+```
+
+## ATE
+
+```{r}
+
+modelAte <- '
+
+playerSmilePre  ~ experimental
+playerSmilePost ~ experimental
+
+playerSmilePre ~~ playerSmilePost
+
+'
+
+ateFit <- sem(
+  model=modelAte,
+  estimator="MLR",
+  meanstructure=TRUE,
+  data=dataAvatar
+)
+
+summary(ateFit)
+```
+
+### Descriptives
+
+```{r}
+
+plotData <- dataAvatar %>%
+  mutate(
+    experimental=as.factor(experimental)
+  )
+
+plotDataLong <- dataAvatarLong %>%
+  mutate(
+    experimental=as.factor(experimental)
+  )
+
+ggplot(data=plotData, aes(x=experimental, y=playerSmilePre, fill=experimental)) +
+  geom_violin(trim = FALSE, alpha = 0.5)+
+  geom_boxplot(width = 0.1, outlier.shape = NA)+
+  scale_fill_manual(
+    values = c("0" = "lightcoral", "1" = "steelblue")
+  ) +
+  labs(
+    title = "Distribution of smiling",
+    x = "Group",
+    y = "Smiling"
+  ) +
+  scale_x_discrete(labels = c("0" = "Control", "1" = "Treatment"))+
+  theme_minimal()+
+  theme(legend.position = "none")
+
+
+ggplot(data=plotData, aes(x=experimental, y=syncShapePreDTW, fill=experimental)) +
+  geom_violin(trim = FALSE, alpha = 0.5)+
+  geom_boxplot(width = 0.1, outlier.shape = NA)+
+  scale_fill_manual(
+    values = c("0" = "seagreen", "1" = "plum4")
+  ) +
+  labs(
+    title = "Distribution of synchrony",
+    x = "Group",
+    y = "Synchrony"
+  ) +
+  scale_x_discrete(labels = c("0" = "Control", "1" = "Treatment"))+
+  theme_minimal()+
+  theme(legend.position = "none")
+
+#formula = y ~ s(x, k = 4)
+ggplot(plotData, aes(x=playerSmilePre, y=syncShapePreDTW, group=experimental, color=experimental, fill=experimental))+
+  geom_jitter(alpha=0.25)+
+  geom_smooth(method="loess", se=TRUE)+
+  scale_color_manual(
+    values = c("0" = "lightcoral", "1" = "steelblue")
+  ) +
+  scale_fill_manual(
+    values = c("0" = "lightcoral", "1" = "steelblue")
+  ) +
+  facet_wrap(~experimental, labeller = labeller(experimental = c(
+    "0" = "Control",
+    "1" = "Treatment"
+  ))) +  
+  labs(
+    title = "Relationship between smiling and synchrony",
+    x = "Smiling",
+    y = "Synchrony"
+  ) +
+  theme_minimal()+
+  theme(legend.position = "none")
+
+ggplot(plotDataLong, aes(x=playerEMA_HL5s, y=avatarEMA_HL5s, group=experimental, color=experimental, fill=experimental))+
+  geom_jitter(alpha=0.05)+
+  geom_smooth(method="loess", se=FALSE)+
+  scale_color_manual(
+    values = c("0" = "lightcoral", "1" = "steelblue")
+  ) +
+  scale_fill_manual(
+    values = c("0" = "lightcoral", "1" = "steelblue")
+  ) +
+  facet_wrap(~experimental, labeller = labeller(experimental = c(
+    "0" = "Control",
+    "1" = "Treatment"
+  ))) +  
+  labs(
+    title = "Relationship between smiling and synchrony",
+    x = "Smiling",
+    y = "Synchrony"
+  ) +
+  theme_minimal()+
+  theme(legend.position = "none")
+```
+
+## Avatar behavior
+
+```{r}
+
+ggplot(dataAvatar, aes(x = totalConcessions)) +
+  geom_histogram(bins = 25, fill = "steelblue") +
+  geom_vline(
+    xintercept = median(dataAvatar$totalConcessions, na.rm = TRUE),
+    color = "grey30",
+    linetype = "dashed"
+  ) +
+  geom_vline(
+    xintercept = mean(dataAvatar$totalConcessions, na.rm = TRUE),
+    color = "grey30",
+    linetype = "solid"
+  ) +
+  theme_minimal()
+
+ggplot(dataAvatar, aes(x=timeToEquilibrium)) +
+  geom_histogram(bins=30, fill="steelblue") +
+  geom_vline(
+    xintercept = median(dataAvatar$timeToEquilibrium, na.rm = TRUE),
+    color = "grey30",
+    linetype = "dashed"
+  ) +
+  geom_vline(
+    xintercept = mean(dataAvatar$timeToEquilibrium, na.rm = TRUE),
+    color = "grey30",
+    linetype = "solid"
+  ) +
+  theme_minimal()
+
+ggplot(dataAvatar, aes(x=mismatchTTE)) +
+  geom_histogram(bins=60, fill="steelblue") +
+  geom_vline(
+    xintercept = median(dataAvatar$mismatchTTE, na.rm = TRUE),
+    color = "grey30",
+    linetype = "dashed"
+  ) +
+  geom_vline(
+    xintercept = mean(dataAvatar$mismatchTTE, na.rm = TRUE),
+    color = "grey30",
+    linetype = "solid"
+  ) +
+  theme_minimal()
+```
+
+## Time
+
+### Descriptives
+
+```{r}
+
+plotData <- dataAvatar %>%
+  mutate(
+    experimental = as.factor(experimental)
+  )
+
+ggplot(plotData, aes(x=roundTime, group=experimental, fill=experimental))+
+  geom_histogram(bins=60)+
+  scale_color_manual(
+    values = c("0" = "lightcoral", "1" = "steelblue")
+  ) +
+  scale_fill_manual(
+    values = c("0" = "lightcoral", "1" = "steelblue")
+  ) +
+  facet_wrap(~experimental, labeller = labeller(experimental = c(
+    "0" = "Control",
+    "1" = "Treatment"
+  ))) +  
+  labs(
+    title = "Distribution of time to agreement",
+    x = "Time to agreement",
+    y = "Count"
+  ) +
+  theme_minimal()+
+  theme(legend.position = "none")
+```
+
+### Exogenous model
+
+```{r}
+
+timeOne <- coxph(
+  Surv(startTime, endTime, agreement) ~ experimental*playerSmilePre + avatarDemand*conflictHigh + totalConcessions + timeToEquilibrium + secondRound + cluster(clusterID),
+  data = dataAvatarLong,
+  ties = "efron"
+)
+
+summary(timeOne)
+```
+
+### Treatment heterogeneity
+
+#### First stage
+
+```{r}
+
+test <- feols(
+  logSyncShapeEMA_HL2s ~ experimental*playerEMA_HL2s + experimental*playerEMA_HL2s^2 + avatarDemand*conflictHigh + totalConcessions + timeToEquilibrium + secondRound | 0,  cluster = "clusterID",
+  data = dataAvatarLong
+)
+
+summary(test)
+
+test2 <- feols(
+  syncShapePreDTW ~ experimental*playerSmilePre + experimental*playerSmilePre^2 + conflictHigh + totalConcessions + timeToEquilibrium + secondRound | 0,  cluster = "clusterID",
+  data = dataAvatar
+)
+
+summary(test2)
+
+dataAvatarLong$fittedATE <- predict(test, newdata=dataAvatarLong)
+```
+
+#### Second stage
+
+```{r}
+
+timeSeven <- coxph(
+  Surv(roundTime, agreement) ~ totalConcessions + timeToEquilibrium + secondRound + cluster(clusterID) + strata(clusterID),
+  data = dataFS,
+  ties = "efron"
+)
+
+summary(timeSeven)
+```
+
+## Test identification
+
+```{r}
+
+idVariables <- c(
+  "clusterID"
+)
+
+analysisVariables <- c(
+  "SIS_C1",
+  "roundTime10s",
+  "avatarDemand",
+  "conflictHigh",
+  "avatarDemand_conflictHigh",
+  "secondRound",
+  "timeToEquilibrium",
+  "totalConcessions"
+)
+
+modelVariables <- c(analysisVariables, idVariables)
+
+demeanedData <- dataAvatar %>%
+  mutate(
+    avatarDemand_conflictHigh = avatarDemand*conflictHigh,
+  ) %>%
+  dplyr::filter(
+    if_all(all_of(modelVariables), ~ !is.na(.x))
+  ) %>%
+  group_by(clusterID) %>%
+  dplyr::filter(n() == 2) %>%
+  mutate(
+    across(
+      all_of(analysisVariables) & where(is.numeric),
+      ~ as.numeric(scale(.x, center = TRUE, scale = FALSE))
+    )
+  ) %>%
+  ungroup()
+```
+
+### SUR
+
+```{r}
+
+modelName <- "SUR"
+
+modelSUR <- '
+  
+  SIS_C1 ~ 0*1 + secondRound + avatarDemand + conflictHigh + avatarDemand_conflictHigh + timeToEquilibrium + totalConcessions
+  
+  roundTime10s ~ 0*1 + secondRound + avatarDemand + conflictHigh + avatarDemand_conflictHigh + timeToEquilibrium + totalConcessions
+  
+  SIS_C1 ~~ roundTime10s
+
+'
+
+fitSUR <- sem(
+  model = modelSUR,
+  estimator = "MLR",
+  meanstructure = TRUE,
+  data = demeanedData
+)
+
+parameterEstimates(fitSUR) %>%
+  dplyr::select(lhs, op, rhs, est, se, z, pvalue) %>%
+  dplyr::filter(!(op=="~1")) %>%
+  mutate(
+    across(c(est, se, z, pvalue), \(x) round(x, digits = 4))
+  )
+```
+
+### Equation-by-equation
+
+```{r}
+
+modelName <- "Univariate"
+
+modelConflict <- '
+  
+  SIS_C1 ~ 0*1 + roundTime10s + secondRound + avatarDemand + conflictHigh + avatarDemand_conflictHigh + timeToEquilibrium + totalConcessions
+  
+'
+
+fitConflict <- sem(
+  model = modelConflict,
+  estimator = "MLR",
+  meanstructure = TRUE,
+  data = demeanedData
+)
+
+parameterEstimates(fitConflict) %>%
+  dplyr::select(lhs, op, rhs, est, se, z, pvalue) %>%
+  dplyr::filter(!(op=="~1")) %>%
+  mutate(
+    across(c(est, se, z, pvalue), \(x) round(x, digits = 4))
+  )
+
+
+modelTime <- '
+  
+  roundTime10s ~ 0*1 + SIS_C1 + secondRound + avatarDemand + conflictHigh + avatarDemand_conflictHigh + timeToEquilibrium + totalConcessions
+  
+'
+
+fitTime <- sem(
+  model = modelTime,
+  estimator = "MLR",
+  meanstructure = TRUE,
+  data = demeanedData
+)
+
+parameterEstimates(fitTime) %>%
+  dplyr::select(lhs, op, rhs, est, se, z, pvalue) %>%
+  dplyr::filter(!(op=="~1")) %>%
+  mutate(
+    across(c(est, se, z, pvalue), \(x) round(x, digits = 4))
+  )
+```
+
+### Triangular system
+
+```{r}
+
+modelName <- "Triangular"
+
+modelTriangular <- '
+  
+  SIS_C1 ~ roundTime10s + secondRound + avatarDemand + conflictHigh + avatarDemand:conflictHigh + realizedConcessions
+  
+  roundTime10s ~ secondRound + avatarDemand + conflictHigh + avatarDemand:conflictHigh + realizedConcessions + timeToEquilibrium
+  
+  SIS_C1 ~~ roundTime10s
+
+'
+
+fitTriangular <- sem(
+  model = modelTriangular,
+  estimator = "MLR",
+  meanstructure = TRUE,
+  data = dataAvatar
+)
+
+parameterEstimates(fitTriangular) %>%
+  dplyr::select(lhs, op, rhs, est, se, z, pvalue) %>%
+  dplyr::filter(!(op=="~1")) %>%
+  mutate(
+    across(c(est, se, z, pvalue), \(x) round(x, digits = 4))
+  )
+```
+
+```{r}
+
+conflict2SLS <- ivreg2(
+  roundTime10s ~ 0 + secondRound + avatarDemand + conflictHigh + avatarDemand_conflictHigh + timeToEquilibrium| SIS_C1 | totalConcessions,
+  data = demeanedData,
+  method = "2sls",
+  clusters = ~clusterID,
+  small = TRUE,
+  dofminus = n_distinct(demeanedData$clusterID),
+  endog = "SIS_C1",
+  first_stage = TRUE
+)
+
+summary(conflict2SLS)
+```
+
+```{r}
+
+conflictOne <- feols(
+  SIS_C1 ~ playerSmilePre*experimental + roundTime + secondRound + conflictHigh | clusterID,  cluster = "clusterID",
+  data = dataAvatar
+)
+
+summary(conflictOne)
+```
+
+### Control function
+
+#### Risk set fun
+
+```{r}
+
+riskSetFun <- function(coxFit, data) {
+  
+  detail <- survival::coxph.detail(
+    coxFit,
+    riskmat = TRUE,
+    rorder = "data"
+  )
+  
+  # List of row indices belonging to each risk set
+  riskRows <- lapply(
+    seq_len(ncol(detail$riskmat)),
+    function(j) which(detail$riskmat[, j] == 1)
+  )
+  
+  usedRows <- match(rownames(detail$y), rownames(data))
+  
+  riskRowsOriginal <- lapply(
+    riskRows,
+    function(i) usedRows[i]
+  )
+  
+  dplyr::bind_rows(
+    lapply(
+      riskRowsOriginal,
+      function(indices) data[indices, , drop = FALSE]
+    ),
+    .id = "riskSet"
+  ) %>%
+    dplyr::mutate(
+      riskSet = as.integer(riskSet),
+      eventTime = detail$time[riskSet]
+    )
+}
+
+dataAvatarBetween <- riskSetFun(coxControl, dataAvatarLong)
+```
+
+#### First stage
+
+```{r}
+
+firstStage <- feols(
+  SIS_C1 ~ avatarDemand*conflictHigh + avatarDemand*endTime + totalConcessions + timeToEquilibrium + secondRound | 0,  cluster = "clusterID",
+  data = dataAvatarBetween
+)
+
+summary(firstStage)
+
+firstStage <- feols(
+  SIS_C1 ~ roundTime10s + avatarDemand*conflictHigh + totalConcessions + timeToEquilibrium + secondRound | 0,  cluster = "clusterID",
+  data = dataAvatarBetween
+)
+
+summary(firstStage)
+
+firstStage <- feols(
+  SIS_C1 ~ avatarDemand*conflictHigh + totalConcessions + secondRound | 0 | roundTime10s ~ timeToEquilibrium,  cluster = "clusterID",
+  data = dataAvatarBetween
+)
+
+summary(firstStage)
+```
+
+#### Second stage
+
+```{r}
+
+coxControl <- coxph(
+  Surv(startTime, endTime, agreement) ~ SIS_C1 + avatarDemand*conflictHigh + totalConcessions + timeToEquilibrium + secondRound + cluster(clusterID) + strata(clusterID),
+  data = dataAvatarLong,
+  ties = "efron",
+  tt = function(x, t, ...) {
+    x * logp1(t)
+  }
+)
+
+summary(coxControl)
+
+linearControl <- feols(
+  roundTime10s ~ SIS_C1 + avatarDemand*conflictHigh + totalConcessions + timeToEquilibrium + secondRound | clusterID,  cluster = "clusterID",
+  data = dataAvatar
+)
+
+summary(linearControl)
+```

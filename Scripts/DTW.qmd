@@ -1,0 +1,852 @@
+---
+title: "DTW"
+format: html
+editor: visual
+---
+
+## Load Libraries
+
+```{r}
+
+library(tidyverse)
+library(dtw)
+library(pbmcapply)
+library(signal)
+```
+
+## Load Data
+
+```{r}
+
+dataF2F <- readRDS("../Datasets/dataF2F.rds") %>%
+  mutate(
+    dyadID = interaction(session, round, group, drop = TRUE)
+  ) %>%
+  left_join(
+    readRDS("../Datasets/dataClockOffsets.rds"),
+    by=join_by(session, player, round)
+  )
+```
+
+### Check for duplicates (recording interruptions)
+
+Check for rounds after session 6 with more than one file
+
+```{r}
+
+basePath <- "../Processed"
+
+fileList <- list.files(basePath, pattern = "^Nico.*\\.rds$")
+
+allFiles <- sub("_[^_]+\\.rds$", "", fileList)
+
+duplicatedIds <- allFiles[duplicated(allFiles)]
+
+duplicatedSessions <- as.integer(sub(".*_S([0-9]+)_.*", "\\1", duplicatedIds))
+
+sum(duplicatedSessions > 6)
+```
+
+### Check available models
+
+```{r}
+
+sampleFile <- readRDS("../Processed/Nico_S12_P4_R09_20260114T203349Z.rds")
+
+names(sampleFile)
+```
+
+## Define label mapping
+
+```{r}
+
+emotions7 <- c("Neutral", "Happy", "Sad", "Surprise", "Fear", "Disgust", "Anger")
+emotions8 <- c("Neutral", "Happy", "Sad", "Surprise", "Fear", "Disgust", "Anger", "Contempt")
+
+BP4D <- c("AU1", "AU2", "AU4", "AU6", "AU7", "AU10", "AU12", "AU14", "AU15", "AU17", "AU23", "AU24")
+
+DISFA <- c("AU1", "AU2", "AU4", "AU6", "AU9", "AU12", "AU25", "AU26")
+
+hybrid <- c('AU1', 'AU2', 'AU4', 'AU5', 'AU6', 'AU7', 'AU9', 'AU10', 'AU11', 'AU12', 'AU13', 'AU14', 'AU15', 'AU16', 'AU17', 'AU18', 'AU19', 'AU20', 'AU22', 'AU23', 'AU24', 'AU25', 'AU26', 'AU27', 'AU32', 'AU38', 'AU39', 'AUL1', 'AUR1', 'AUL2', 'AUR2', 'AUL4', 'AUR4', 'AUL6', 'AUR6', 'AUL10', 'AUR10', 'AUL12', 'AUR12', 'AUL14', 'AUR14')
+
+modelMap <- list(
+  FERAU = "Happy",
+  DDAMFN_Aff7 = emotions7,
+  DDAMFN_Aff8 = emotions8,
+  DDAMFN_RAF = emotions7,
+  MEGraphAU_BP4D_FLD1 = BP4D,
+  MEGraphAU_DISFA_FLD1 = DISFA,
+  OpenGraphAU = hybrid,
+  OpenFace_Emotions = emotions8,
+  OpenFace_AU = DISFA
+)
+```
+
+## Define helpers
+
+### File loading
+
+```{r}
+
+loadFile <- function(fileList, session, player, roundNum, model="DDAMFN_Aff7") {
+  
+  padded <- ifelse(roundNum < 10, paste0("0", roundNum), roundNum)
+  
+  pattern <- paste0("S", session, "_", player, "_R", padded)
+  
+  fileName <- grep(pattern, fileList, value = TRUE)
+  
+  if (length(fileName) == 0) {
+    cat(
+      "Error, no file for ", pattern, "\n\n"
+    )
+    return(NA)
+  }
+  
+  file <- readRDS(file.path(basePath, fileName))
+  
+  df <- do.call(
+    cbind,
+    lapply(
+      model,
+      function(i) {
+        df <- as.data.frame(file[[i]])
+        names(df) <- paste0(i, ":", modelMap[[i]])
+        return(df)
+      }
+    )
+  )
+  
+  timestamps <- file[["timestamps"]]
+  
+  timestampsLngth <- length(timestamps)
+  
+  dfLgth <- nrow(df)
+  
+  if (timestampsLngth != dfLgth) {
+    cat(
+      "Error in file ", fileName, "\n\n",
+      "Timestamps length: ", timestampsLngth, "\n\n",
+      "Inference length: ", dfLgth, "\n\n"
+    )
+    return(NA)
+  } else {
+    if (session <= 21) {
+      df$timestamps <- timestamps - 7
+    } else {
+      df$timestamps <- timestamps
+    }
+  }
+  
+  cat(
+    fileName, "\n\n",
+    "Session match: ", file[["session"]] == session,
+    ", Player match: ", file[["player"]] == player,
+    ", Round match: ", file[["round"]] == roundNum, 
+    "\n\n"
+  )
+  
+  return(df)
+}
+```
+
+### Series matching
+
+```{r}
+
+matchSeries <- function(ts1, ts2, roundTime, epsilon=0.5) {
+  
+  orderedTs1 <- integer(0)
+  
+  orderedTs2 <- integer(0)
+  
+  taken <- integer(0)
+  
+  tsPair <- list(ts1[ts1 < roundTime + epsilon], ts2[ts2 < roundTime + epsilon])
+  
+  latestStart <- which.max(c(min(ts1), min(ts2)))
+  
+  reference <- tsPair[[latestStart]] # Set the ts starting later as the reference
+  
+  isTs1 <- latestStart == 1
+  
+  contrast <- if (isTs1) tsPair[[2]] else tsPair[[1]]
+  
+  medianDiff <- median(diff(reference)) * 0.55
+  
+  for (t in seq_along(reference)) {
+    
+    lower <- reference[t] - medianDiff
+    upper <- reference[t] + medianDiff
+    
+    indices <- which(lower < contrast & contrast < upper)
+    
+    availableIndices <- indices[!(indices %in% taken)]
+    
+    hasMatch <- length(availableIndices) > 0
+    
+    if (hasMatch) {
+      
+      selected <- availableIndices[which.min(abs(contrast[availableIndices] - reference[t]))]
+      
+      taken <- c(taken, selected)
+      
+      if (isTs1) {
+        orderedTs1 <- c(orderedTs1, t)
+        orderedTs2 <- c(orderedTs2, selected)
+      } else {
+        orderedTs1 <- c(orderedTs1, selected)
+        orderedTs2 <- c(orderedTs2, t)
+      }
+    }
+  }
+  
+  cat(
+    "Sucessfully matched ", length(orderedTs1), " of ", length(reference), " timestamps.",
+    "\n\n"
+  )
+  
+  diagnostics <- list(length1=length(tsPair[[1]]), length2=length(tsPair[[2]]), nMatched=length(orderedTs1), medianDiff1 = median(diff(tsPair[[1]])), meanDiff1 = mean(diff(tsPair[[1]])), medianDiff2 = median(diff(tsPair[[2]])), meanDiff2 = mean(diff(tsPair[[2]])))
+    
+  return(list(ts1=orderedTs1, ts2=orderedTs2, diagnostics=diagnostics))
+  
+}
+```
+
+### DTW
+
+```{r}
+
+shapeDescriptor <- function(x, windowSize) {
+  
+  stopifnot(windowSize %% 2 == 1)
+  
+  padding <- (windowSize - 1) / 2
+  
+  xPadded <- rbind(
+    x[rep(1, padding), , drop = FALSE],
+    x,
+    x[rep(nrow(x), padding), , drop = FALSE]
+  )
+  
+  embed(xPadded, dimension = windowSize)
+}
+
+derivDescriptor <- function(x, windowSize) {
+  
+  do.call(
+    cbind,
+    lapply(
+      seq_len(ncol(x)),
+      function(j) {
+        signal::sgolayfilt(
+          x[, j],
+          p = 3,
+          n = windowSize,
+          m = 1,
+          ts = 1 / 54
+        )
+      }
+    )
+  )
+}
+
+alignFun <- function(alignedSignal, signal1, signal2, timestamps, warpingWindow = 3, downsample=1) {
+  
+  aligned <- lapply(
+    seq_along(alignedSignal),
+    function(i) {
+      aligned <- dtw(
+        signal1[[i]], 
+        signal2[[i]],
+        dist.method = "Euclidean",
+        step.pattern = symmetric2,
+        window.type = "sakoechiba",
+        window.size = 54 * warpingWindow / downsample, # median fps times allowed warping seconds, then downsampled
+        open.begin = FALSE,
+        open.end   = FALSE,
+        keep = FALSE, # don't store cost matrix
+        distance.only = FALSE # don't return only scalar distance
+      )
+      
+      aligned1 <- signal1[[i]][aligned$index1, , drop=FALSE]
+      aligned2 <- signal2[[i]][aligned$index2, , drop=FALSE]
+      
+      pathIndex <- pmax(
+        aligned$index1,
+        aligned$index2
+      )
+      
+      return(
+        list(
+          distance = aligned$normalizedDistance, 
+          path = unname(sqrt(rowSums((aligned1 - aligned2)^2))),
+          pathTimestamps = timestamps[pathIndex],
+          step = aligned$stepsTaken,
+          warpingWindow = warpingWindow
+        )
+      )
+    }
+  )
+}
+
+pseudoFun <- function(model, alignedSignal, signal1, signal2, iterations=1000, type="standard", warpingWindow=3, descriptorWindow=9, downsample=1) {
+
+  pseudoAligned <- sapply(
+    seq_along(alignedSignal),
+    function(i) {
+      
+      signalLength <- nrow(signal1[[i]])
+      
+      pseudoSignal1 <- signal1[[i]]
+      pseudoSignal2 <- signal2[[i]]
+      
+      if(type == "derivative") {
+        pseudoSignal1 <- derivDescriptor(signal1[[i]], descriptorWindow)
+        pseudoSignal2 <- derivDescriptor(signal2[[i]], descriptorWindow)
+      }
+      
+      pseudoAligned <- mean(
+        vapply(
+          seq_len(iterations),
+          FUN.VALUE = numeric(1),
+          FUN = function(j) {
+            
+            shuffle1 <- pseudoSignal1[sample.int(signalLength), , drop = FALSE]
+            shuffle2 <- pseudoSignal2[sample.int(signalLength), , drop = FALSE]
+            
+            if (type=="shape") {
+              shuffle1 <- shapeDescriptor(shuffle1, descriptorWindow)
+              shuffle2 <- shapeDescriptor(shuffle2, descriptorWindow)
+            }
+            
+            # Downsample one half for full analyses, one third for downsampled analyses
+            downsampleInt <- ifelse(downsample > 1, 3, 2)
+            filterMask <- seq(from=sample(c(1,2), size=1), to=signalLength, by=downsampleInt)
+            
+            shuffle1 <- shuffle1[filterMask, , drop = FALSE]
+            shuffle2 <- shuffle2[filterMask, , drop = FALSE]
+            
+            distance <- dtw(
+              shuffle1, 
+              shuffle2,
+              dist.method = "Euclidean",
+              step.pattern = symmetric2,
+              window.type = "sakoechiba",
+              window.size = 54 * warpingWindow / downsampleInt, # median fps times allowed seconds, then downsampled
+              open.begin = FALSE,
+              open.end   = FALSE,
+              keep = FALSE,
+              distance.only = TRUE
+            )
+            
+            return(distance$normalizedDistance)
+          }
+        )
+      )
+    }
+  )
+  
+  names(pseudoAligned) <- sapply(seq_along(alignedSignal), \(x) paste0(model[[x]], ":", paste(alignedSignal[[x]], collapse = "_")))
+  
+  return(pseudoAligned)
+}
+
+dtwFun <- function(model, alignedSignal, signal1, signal2, timestamps, type="standard", warpingWindow=3, descriptorWindow=9, downsample=1) {
+  
+  signalLength <- nrow(signal1[[1]])
+  
+  filterMask <- seq(from=1, to=signalLength, by=downsample)
+  
+  if (type=="standard") {
+    
+    aligned <- alignFun(alignedSignal, signal1, signal2, timestamps, warpingWindow, downsample)
+    
+  } else if (type=="shape") {
+  
+    shape1 <- lapply(
+      seq_along(alignedSignal),
+      function(i) {
+        shape <- shapeDescriptor(signal1[[i]], descriptorWindow)
+        shape <- shape[filterMask, , drop = FALSE]
+        return(shape)
+      }
+    )
+    shape2 <- lapply(
+      seq_along(alignedSignal),
+      function(i) {
+        shape <- shapeDescriptor(signal2[[i]], descriptorWindow)
+        shape <- shape[filterMask, , drop = FALSE]
+        return(shape)
+      }
+    )
+    
+    aligned <- alignFun(alignedSignal, shape1, shape2, timestamps[filterMask], warpingWindow, downsample)
+    
+  } else if (type=="derivative") {
+    
+    derivative1 <- lapply(
+      seq_along(alignedSignal),
+      function(i) {
+        derivative <- derivDescriptor(signal1[[i]], descriptorWindow)
+        derivative <- derivative[filterMask, , drop = FALSE]
+        return(derivative)
+      }
+    )
+    derivative2 <- lapply(
+      seq_along(alignedSignal),
+      function(i) {
+        derivative <- derivDescriptor(signal2[[i]], descriptorWindow)
+        derivative <- derivative[filterMask, , drop = FALSE]
+        return(derivative)
+      }
+    )
+    
+    aligned <- alignFun(alignedSignal, derivative1, derivative2, timestamps[filterMask], warpingWindow, downsample)
+
+  } else {
+    return(NULL)
+  }
+  
+  names(aligned) <- sapply(seq_along(alignedSignal), \(x) paste0(model[[x]], ":", paste(alignedSignal[[x]], collapse = "_")))
+  
+  return(aligned)
+}
+```
+
+### Master function
+
+```{r}
+
+alignDyad <- function(id, data, model, alignedSignal, type, warpingWindow=3, descriptorWindow=NULL, downsample=1, pseudo=FALSE, naThreshold=1) {
+  
+  filtered <- data[data$dyadID == id, ]
+  
+  session   <- filtered$session[[1]]
+  roundNum  <- filtered$round[[1]]
+  roundTime <- filtered$roundTime[[1]]
+  agreement <- filtered$agreement[[1]]
+  
+  player1 <- filtered$player[filtered$idInGroup == 1][[1]]
+  player2 <- filtered$player[filtered$idInGroup == 2][[1]]
+  
+  clockOffset1 <- filtered$medianClockOffset[filtered$idInGroup == 1][[1]]
+  clockOffset2 <- filtered$medianClockOffset[filtered$idInGroup == 2][[1]]
+  
+  df1 <- loadFile(fileList, session, player1, roundNum, model)
+  
+  df2 <- loadFile(fileList, session, player2, roundNum, model)
+  
+  if (length(df1) == 1 || length(df2) == 1) {
+    cat("Error in file or timestamps for dyadID: ", id)
+    
+    return(list(dtw = NA, diagnostics = NA))
+  }
+  
+  df1$timestamps <- df1$timestamps + clockOffset1
+  df2$timestamps <- df2$timestamps + clockOffset2
+  
+  roundTime <- filtered$roundTime[[1]]
+  
+  pairingList <- matchSeries(df1$timestamps, df2$timestamps, roundTime)
+  
+  ordered1 <- df1[pairingList[["ts1"]],]
+  
+  ordered2 <- df2[pairingList[["ts2"]],]
+  
+  matchedTimestamps <- pmax(
+    ordered1[["timestamps"]],
+    ordered2[["timestamps"]]
+  )
+  
+  naThreshold <- 1
+
+  gaps <- which(
+    diff(matchedTimestamps) > naThreshold &
+    matchedTimestamps[-1] < 0
+  )
+  cutOff <- if (length(gaps) > 0) {
+    max(gaps) + 1
+  } else {
+    1
+  }
+  keep <- seq.int(cutOff, length(matchedTimestamps))
+  ordered1 <- ordered1[keep, , drop = FALSE]
+  ordered2 <- ordered2[keep, , drop = FALSE]
+  matchedTimestamps <- matchedTimestamps[keep]
+  
+  if (nrow(ordered1) == 0 || nrow(ordered2) == 0) {
+    cat("No matched timestamps for dyadID: ", id)
+    
+    pairingList[["diagnostics"]] <- c(pairingList[["diagnostics"]], list(meanDistance=NA, medianDistance=NA))
+    
+    return(list(dtw = NA, diagnostics = pairingList[["diagnostics"]]))
+  }
+  
+  meanDistance <- mean(abs(ordered1[["timestamps"]] - ordered2[["timestamps"]]))
+  
+  medianDistance <- median(abs(ordered1[["timestamps"]] - ordered2[["timestamps"]]))
+  
+  pairingList[["diagnostics"]] <- c(pairingList[["diagnostics"]], list(meanDistance=meanDistance, medianDistance=medianDistance))
+  
+  signal1 <- lapply(
+    seq_along(alignedSignal),
+    function(i) {
+      keys <- paste0(model[[i]], ":", alignedSignal[[i]])
+      signal <- as.matrix(ordered1[, keys])
+    }
+  )
+  
+  signal2 <- lapply(
+    seq_along(alignedSignal),
+    function(i) {
+      keys <- paste0(model[[i]], ":", alignedSignal[[i]])
+      signal <- as.matrix(ordered2[, keys])
+    }
+  )
+  
+  aligned <- dtwFun(model, alignedSignal, signal1, signal2, timestamps=matchedTimestamps, type, warpingWindow, descriptorWindow, downsample)
+  
+  if (pseudo) {
+    
+    pseudoAligned <- pseudoFun(model, alignedSignal, signal1, signal2, iterations=1000, type, warpingWindow, descriptorWindow, downsample)
+    
+    return(list(dyadID=id, roundTime=roundTime, agreement=agreement, aligned=aligned, pseudo=pseudoAligned, diagnostics=pairingList[["diagnostics"]]))
+  }
+
+  result <- list(list(aligned=aligned))
+  
+  names(result) <- type
+    
+  return(list(dyadID=id, roundTime=roundTime, agreement=agreement, aligned=aligned, diagnostics = pairingList[["diagnostics"]]))
+}
+```
+
+## Run alignment
+
+```{r}
+
+dyadIDs <- unique(dataF2F$dyadID)
+
+brokenIDs <- c("9.8.3", "9.10.1") # Videos damaged during transfer
+
+dyadIDs <- setdiff(dyadIDs, brokenIDs)
+```
+
+```{r}
+
+dtwType <- "derivative"
+windowTime <- 0.1 # Descriptor window in seconds 
+models <- c("FERAU") # DDAMFN_Aff7, FERAU, OpenGraphAU
+signals <- list(c("Happy")) # "Happy", "AU6", "AU12"
+warpingSeconds <- 3 # Seconds of warping allowed
+epsilon <- 0.5 # Seconds of outstanding potential misalignment between wall clocks
+
+fps <- 54
+windowRaw <- fps * windowTime
+windowFrames <- as.integer(
+  2 * round((windowRaw - 1) / 2) + 1
+) # Round to closest odd
+
+windowFrames
+
+dtwResults <- pbmclapply(
+  dyadIDs,
+  alignDyad,
+  data=dataF2F,
+  model=models,
+  alignedSignal=signals,
+  type=dtwType,
+  warpingWindow=warpingSeconds + epsilon,
+  descriptorWindow=windowFrames,
+  downsample=2, # 3 = 18 fps, 2 = 27 fps
+  pseudo=T,
+  mc.cores = 15,
+  mc.preschedule = FALSE
+)
+
+resultsPath <- "../Datasets/dtwResults.rds"
+
+if (file.exists(resultsPath)) {
+  storedResults <- readRDS(resultsPath)
+} else {
+  storedResults <- list()
+}
+
+signalNames <- unname(
+  Map(
+    function(modelName, signalSet) {
+      paste0(modelName, ":", paste(signalSet, collapse = "_"))
+    },
+    models,
+    signals
+  ) %>%
+    unlist()
+)
+
+for (i in seq_along(dtwResults)) {
+  for (s in signalNames) {
+    storedResults[[dtwType]][[i]][["aligned"]][[s]] <- dtwResults[[i]][["aligned"]][[s]]
+    storedResults[[dtwType]][[i]][["pseudo"]][[s]] <- dtwResults[[i]][["pseudo"]][[s]]
+    
+  }
+}
+
+saveRDS(storedResults, file = resultsPath)
+```
+
+```{r}
+
+storedResults <- readRDS(file = "../Datasets/dtwResults.rds")
+```
+
+```{r}
+
+dtwProcessFun <- function(dtwData) {
+  dtwSummary <- do.call(
+    dplyr::bind_rows,
+    lapply(
+      seq_along(dtwData),
+      function(type) {
+        typeName <- names(dtwData)[[type]]
+        do.call(
+          dplyr::bind_rows,
+          lapply(
+            dtwData[[type]],
+            function(dyad) {
+              results <- do.call(
+                dplyr::bind_rows,
+                lapply(
+                  names(dyad$aligned),
+                  function(modelName) {
+                    result <- tibble(
+                      dyadID = dyad[["dyadID"]],
+                      type = typeName,
+                      model = strsplit(modelName, ":")[[1]][[1]],
+                      signal = strsplit(modelName, ":")[[1]][[2]],
+                      value = dyad$aligned[[modelName]]$distance,
+                      pseudo = dyad$pseudo[[modelName]]
+                    )
+                  }
+                )
+              )
+            }
+          )
+        )
+      }
+    )
+  )
+  
+  dtwSummary <- as.data.frame(dtwSummary)
+  
+  return(dtwSummary)
+}
+```
+
+```{r}
+
+dtwDf <- dtwProcessFun(storedResults)
+
+saveRDS(dtwDf, file = "../Datasets/dataDTW.rds")
+```
+
+## DTW Long
+
+```{r}
+
+dtwLongFun <- function(dtwData, halfLife=2, riskWindow=0.25) {
+  dtwLong <- do.call(
+    dplyr::bind_rows,
+    lapply(
+      seq_along(dtwData),
+      function(type) {
+        typeName <- names(dtwData)[[type]]
+        do.call(
+          dplyr::bind_rows,
+          lapply(
+            dtwData[[type]],
+            function(dyad) {
+              results <- do.call(
+                dplyr::bind_rows,
+                lapply(
+                  names(dyad$aligned),
+                  function(modelName) {
+                    
+                    roundTime <- dyad$roundTime
+                    agreement <- dyad$agreement
+                    path <- dyad$aligned[[modelName]]$path
+                    weights <- c(2, ifelse(dyad$aligned[[modelName]]$step==1, 2, 1))
+                    ts <- dyad$aligned[[modelName]]$pathTimestamps
+                    pseudo <- dyad$pseudo[[modelName]]
+                    dyadID <- dyad[["dyadID"]]
+                    
+                    H <- halfLife # Half-life
+                    tau <- H / log(2)
+                    EMA <- c()
+                    tsEMA <- c()
+                    i <- 1
+                    
+                    while (i <= length(ts)) {
+                      descriptorMask <- ts == ts[i]
+                      descriptor <- sqrt(
+                        sum(weights[descriptorMask]*(path[descriptorMask])^2) / 
+                        sum(weights[descriptorMask])
+                      )
+                      if (length(EMA) == 0) {
+                        update <- descriptor
+                      } else {
+                        dt <- ts[i] - tsEMA[length(tsEMA)]
+                        alpha <- 1 - exp(-dt / tau)
+                        update <- EMA[length(EMA)] + alpha * (descriptor - EMA[length(EMA)])
+                      }
+                      EMA <- append(EMA, update)
+                      tsEMA <- append(tsEMA, ts[i])
+                      
+                      i <- i + sum(descriptorMask)
+                    }
+                    
+                    roundStart <- 0
+                    
+                    startTimes <- seq(roundStart, roundTime, by=riskWindow)
+                    startTimes <- startTimes[startTimes < roundTime]
+                    endTimes <- c(startTimes[-1], roundTime)
+                    sampledPath <- c()
+                    
+                    for (t in startTimes) {
+                      
+                      leftCandidates <- tsEMA[tsEMA <= t]
+                      rightCandidates <- tsEMA[tsEMA > t]
+                      
+                      if (length(leftCandidates) == 0) {
+                        
+                        sampledPath <- c(sampledPath, NA)
+                        
+                      } else {
+                        
+                        leftLimit <- max(leftCandidates)
+                        
+                        if (t - leftLimit > H) {
+                          
+                          sampledPath <- c(sampledPath, NA)
+                          
+                        } else if (length(rightCandidates) == 0) {
+                          
+                          leftEMA <- EMA[match(leftLimit, tsEMA)]
+                          sampledPath <- c(sampledPath, leftEMA)
+                          
+                        } else {
+                          
+                          rightLimit <- min(rightCandidates)
+                          
+                          if (rightLimit - t > H) {
+                            
+                            leftEMA <- EMA[match(leftLimit, tsEMA)]
+                            sampledPath <- c(sampledPath, leftEMA)
+                            
+                          } else {
+                            
+                            weight <- (rightLimit - t) /
+                              (rightLimit - leftLimit)
+                            
+                            leftEMA <- EMA[match(leftLimit, tsEMA)]
+                            rightEMA <- EMA[match(rightLimit, tsEMA)]
+                            
+                            weightedEMA <- weight * leftEMA +
+                              (1 - weight) * rightEMA
+                            
+                            sampledPath <- c(sampledPath, weightedEMA)
+                          }
+                        }
+                      }
+                    }
+                    
+                    result <- tibble(
+                      dyadID = dyadID,
+                      type = typeName,
+                      model = strsplit(modelName, ":")[[1]][[1]],
+                      signal = strsplit(modelName, ":")[[1]][[2]],
+                      valueEMA = sampledPath,
+                      startTime = startTimes,
+                      endTime = endTimes,
+                      agreement = as.integer(
+                        agreement == 1 &
+                        seq_along(startTimes) == length(startTimes)
+                      ),
+                      pseudo = pseudo
+                    )
+                  }
+                )
+              )
+            }
+          )
+        )
+      }
+    )
+  )
+  
+  dtwLong <- as.data.frame(dtwLong)
+  
+  return(dtwLong)
+}
+```
+
+```{r}
+
+dtwLong <- dtwLongFun(storedResults, halfLife=2, riskWindow=0.25)
+
+saveRDS(dtwLong, file = "../Datasets/dataLongDTW.rds")
+```
+
+```{r}
+
+finalMissing <- dtwLong %>%
+  group_by(dyadID, model) %>%
+  filter(endTime == max(endTime)) %>%
+  summarise(
+    finalValueNA = is.na(values),
+    roundTime = endTime,
+    .groups = "drop"
+  )
+
+finalMissing %>%
+  group_by(dyadID) %>%
+  summarise(
+    modelsMissingAtEnd = sum(finalValueNA),
+    anyModelMissingAtEnd = any(finalValueNA),
+    allModelsMissingAtEnd = all(finalValueNA),
+    .groups = "drop"
+  ) %>%
+  summarise(
+    dyadsAnyModelMissing = sum(anyModelMissingAtEnd),
+    dyadsAllModelsMissing = sum(allModelsMissingAtEnd)
+  )
+```
+
+Diagnostics data frame
+
+```{r}
+
+
+template <- dtwResults[[which(!sapply(dtwResults, is.character))[1]]]$diagnostics
+cols <- names(template)
+
+safe_diag <- function(x) {
+  if (!is.character(x) && !is.null(x$diagnostics)) {
+    as.data.frame(x$diagnostics, stringsAsFactors = FALSE)
+  } else {
+    as.data.frame(as.list(setNames(rep(NA, length(cols)), cols)))
+  }
+}
+
+diagnosticsDf <- do.call(
+  rbind,
+  lapply(dtwResults, safe_diag)
+)
+```
+
+```{r}
+
+saveRDS(diagnosticsDf, file = "../Datasets/diagnosticsDTW.rds")
+```
+
+## 
